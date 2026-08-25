@@ -1,9 +1,28 @@
 from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 from sentence_transformers import SentenceTransformer
-import pdfplumber
 from docx import Document
+from pypdf import PdfReader, PdfWriter
+from markitdown import MarkItDown
 import numpy as np
 import os
+import base64
+import tempfile
+import requests
+
+# ——— Image captioning via Groq vision model ———
+# Uses the same GROQ_API_KEY env var as orchestrator.py's text LLM calls.
+# NOTE: verify GROQ_VISION_MODEL is still current at
+# https://console.groq.com/docs/models before your demo — Groq's
+# available vision models change over time.
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+IMAGE_CAPTION_PROMPT = (
+    "Describe this lecture slide image or diagram in 1-2 sentences. "
+    "Focus on the educational content: labels, steps, relationships, or "
+    "data shown. If it's purely decorative (logo, background), say so briefly."
+)
 
 # ——— Global state (loaded once, reused across requests) ———
 _model = None
@@ -25,6 +44,9 @@ _FOLLOWUP_PHRASES = [
 ]
 
 
+_markitdown = None
+
+
 def _get_model():
     global _model
     if _model is None:
@@ -33,79 +55,266 @@ def _get_model():
     return _model
 
 
+def _get_markitdown():
+    global _markitdown
+    if _markitdown is None:
+        _markitdown = MarkItDown()
+    return _markitdown
+
+
+def _caption_image_bytes(image_bytes, mime_type="image/png"):
+    """
+    Sends raw image bytes to a Groq vision model and returns a short
+    caption. Fails soft (returns "") if no API key is set or the call
+    errors — a missing caption should never block a file upload.
+    """
+    if not GROQ_API_KEY:
+        return ""
+    try:
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+        data_uri = f"data:{mime_type};base64,{b64}"
+        resp = requests.post(
+            GROQ_CHAT_URL,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            json={
+                "model": GROQ_VISION_MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": IMAGE_CAPTION_PROMPT},
+                        {"type": "image_url", "image_url": {"url": data_uri}},
+                    ],
+                }],
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"[RAG] Image captioning failed (skipping image): {e}")
+        return ""
+
+
+def _caption_pptx_slide_images(slide):
+    """Returns a list of '[Image: ...]' caption strings for every picture
+    shape on this slide."""
+    captions = []
+    for shape in slide.shapes:
+        if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+            try:
+                caption = _caption_image_bytes(
+                    shape.image.blob, shape.image.content_type or "image/png"
+                )
+            except Exception as e:
+                print(f"[RAG] Could not read pptx image: {e}")
+                caption = ""
+            if caption:
+                captions.append(f"[Image: {caption}]")
+    return captions
+
+
+def _strip_markitdown_comments(md_text):
+    """Removes MarkItDown's own '<!-- Slide number: N -->' comments AND
+    its bare '![filename](Picture2.jpg)' image placeholders — neither
+    carries real information; real image captions (if any) are generated
+    separately via _caption_image_bytes() and appended by the caller."""
+    lines = []
+    for l in md_text.split("\n"):
+        stripped = l.strip()
+        if stripped.startswith("<!--") and stripped.endswith("-->"):
+            continue
+        if stripped.startswith("!["):
+            continue
+        lines.append(l)
+    return "\n".join(lines).strip()
+
+
+def _markdown_to_heading_and_points(md_text):
+    """
+    Splits a single chunk's markdown into (heading, points):
+    - heading = first '#' line found, if any (title placeholder text)
+    - points  = every other non-empty line (bullets, table rows, body text)
+    """
+    heading = ""
+    points = []
+    for raw_line in md_text.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        # MarkItDown inserts its own "<!-- Slide number: N -->" comment per
+        # file; since we convert one slide/page at a time this is always
+        # "1" and meaningless — our own slide_number field is authoritative.
+        if line.startswith("<!--") and line.endswith("-->"):
+            continue
+        # Drop MarkItDown's bare "![filename](Picture2.jpg)" placeholder —
+        # meaningless without a real caption; real captions (if any) are
+        # generated separately via _caption_image_bytes() and appended by
+        # the caller.
+        if line.startswith("!["):
+            continue
+        if line.startswith("#") and not heading:
+            heading = line.lstrip("#").strip()
+        else:
+            points.append(line)
+    return heading, points
+
+
 def _extract_from_pptx(path):
+    """
+    Converts each slide individually via MarkItDown (keeps slide_number
+    intact for navigation/"repeat slide N", while gaining markdown table
+    support that the old python-pptx-only extractor didn't have).
+    """
+    converter = _get_markitdown()
     prs = Presentation(path)
+    num_slides = len(prs.slides)
     chunks = []
-    for i, slide in enumerate(prs.slides, start=1):
-        heading = ""
-        title_shape = None
-        try:
-            if slide.shapes.title is not None and slide.shapes.title.has_text_frame:
-                title_shape = slide.shapes.title
-                heading = title_shape.text_frame.text.strip()
-        except Exception:
-            title_shape = None
 
-        texts = []
-        for shape in slide.shapes:
-            if shape is title_shape:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        for i in range(num_slides):
+            # Build a temp single-slide pptx by stripping all other slide
+            # references from the slide list (fast — no re-encoding of media).
+            single = Presentation(path)
+            slide_id_list = single.slides._sldIdLst
+            all_ids = list(slide_id_list)
+            for j, sld in enumerate(all_ids):
+                if j != i:
+                    slide_id_list.remove(sld)
+            slide_path = os.path.join(tmp_dir, f"_slide_{i}.pptx")
+            single.save(slide_path)
+
+            result = converter.convert(slide_path)
+            md_text = _strip_markitdown_comments(result.text_content or "")
+
+            # Caption any pictures on the real (original) slide object —
+            # markitdown itself only emits a meaningless filename placeholder.
+            image_captions = _caption_pptx_slide_images(prs.slides[i])
+            if image_captions:
+                md_text = (md_text + "\n" + "\n".join(image_captions)).strip()
+
+            if not md_text:
                 continue
-            if shape.has_text_frame:
-                for paragraph in shape.text_frame.paragraphs:
-                    line = "".join(run.text for run in paragraph.runs)
-                    if line.strip():
-                        texts.append(line.strip())
 
-        full_text = (heading + " " if heading else "") + " ".join(texts)
-        full_text = full_text.strip()
-        if full_text:
-            # "heading" is the slide's actual title placeholder text, kept
-            # separate from "points" (the real body bullets) so the
-            # orchestrator doesn't treat titles or footer/metadata text as
-            # if they were content points to individually explain.
+            heading, points = _markdown_to_heading_and_points(md_text)
             chunks.append({
-                "slide_number": i,
-                "text": full_text,
+                "slide_number": i + 1,
+                "text": md_text,
                 "heading": heading,
-                "points": texts,
+                "points": points,
             })
     return chunks
 
 
 def _extract_from_pdf(path):
+    """
+    Converts each page individually via MarkItDown (keeps slide_number =
+    page number for navigation, while gaining proper markdown table
+    extraction that pdfplumber's raw text often garbled).
+    """
+    converter = _get_markitdown()
+    reader = PdfReader(path)
+    num_pages = len(reader.pages)
     chunks = []
-    with pdfplumber.open(path) as pdf:
-        for i, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text()
-            if text and text.strip():
-                # PDFs don't have a clean bullet structure like pptx, so
-                # each non-empty line is treated as one point.
-                lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
-                chunks.append({"slide_number": i, "text": text.strip(), "points": lines})
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        for i in range(num_pages):
+            writer = PdfWriter()
+            writer.add_page(reader.pages[i])
+            page_path = os.path.join(tmp_dir, f"_page_{i}.pdf")
+            with open(page_path, "wb") as f:
+                writer.write(f)
+
+            result = converter.convert(page_path)
+            md_text = _strip_markitdown_comments(result.text_content or "")
+
+            # MarkItDown's PDF converter is text/table-only — it does not
+            # touch embedded images at all, so we extract + caption them
+            # ourselves here.
+            image_captions = []
+            for img in reader.pages[i].images:
+                try:
+                    caption = _caption_image_bytes(img.data, "image/png")
+                except Exception as e:
+                    print(f"[RAG] Could not read pdf image: {e}")
+                    caption = ""
+                if caption:
+                    image_captions.append(f"[Image: {caption}]")
+            if image_captions:
+                md_text = (md_text + "\n" + "\n".join(image_captions)).strip()
+
+            if not md_text:
+                continue
+
+            _, points = _markdown_to_heading_and_points(md_text)
+            chunks.append({
+                "slide_number": i + 1,
+                "text": md_text,
+                "points": points,
+            })
     return chunks
 
 
 def _extract_from_docx(path):
-    doc = Document(path)
+    """
+    DOCX has no page/slide concept, so we keep the original heuristic:
+    start a new chunk at each heading. MarkItDown converts the whole
+    file once (fast, single call) and now also captures tables, which
+    the old python-docx-paragraphs-only extractor silently skipped.
+    """
+    converter = _get_markitdown()
+    result = converter.convert(path)
+    md_text = _strip_markitdown_comments(result.text_content or "")
+    if not md_text:
+        return []
+
     chunks = []
-    current = []
+    current_lines = []
     chunk_number = 1
-    for para in doc.paragraphs:
-        text = para.text.strip()
-        if not text:
-            continue
 
-        style_name = ""
-        if para.style is not None:
-            style_name = getattr(para.style, "name", "") or ""
-
-        if style_name.startswith("Heading") and current:
-            chunks.append({"slide_number": chunk_number, "text": " ".join(current), "points": list(current)})
+    def flush():
+        nonlocal current_lines, chunk_number
+        text_block = "\n".join(l.strip() for l in current_lines if l.strip())
+        if text_block:
+            _, points = _markdown_to_heading_and_points(text_block)
+            chunks.append({
+                "slide_number": chunk_number,
+                "text": text_block,
+                "points": points,
+            })
             chunk_number += 1
-            current = []
-        current.append(text)
-    if current:
-        chunks.append({"slide_number": chunk_number, "text": " ".join(current), "points": list(current)})
+        current_lines = []
+
+    for raw_line in md_text.split("\n"):
+        line = raw_line.strip()
+        if line.startswith("#") and current_lines:
+            flush()
+        current_lines.append(line)
+    flush()
+
+    # python-docx has no reliable way to know WHERE in the document an
+    # image sits relative to headings, so — unlike pptx/pdf, where each
+    # image is captioned into its own numbered slide/page — docx images
+    # are captioned and appended as one trailing chunk rather than being
+    # placed inline near the right section.
+    doc = Document(path)
+    image_captions = []
+    for rel in doc.part.rels.values():
+        if "image" in rel.reltype:
+            try:
+                caption = _caption_image_bytes(rel.target_part.blob, rel.target_part.content_type)
+            except Exception as e:
+                print(f"[RAG] Could not read docx image: {e}")
+                caption = ""
+            if caption:
+                image_captions.append(f"[Image: {caption}]")
+    if image_captions:
+        text_block = "Images in this document:\n" + "\n".join(image_captions)
+        chunks.append({
+            "slide_number": chunk_number,
+            "text": text_block,
+            "points": image_captions,
+        })
+
     return chunks
 
 
@@ -323,4 +532,3 @@ def get_ordered_chunks():
     returns only the top-k matches for a specific question).
     """
     return list(_slide_texts)
-

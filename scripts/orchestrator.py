@@ -30,7 +30,7 @@ import rag_engine
 # since USB device indices can shift after every reboot/reconnect
 # (this was the root cause of the "Invalid number of channels" bug).
 # =====================================================================
-MIC_NAME_HINT = "USB"   # substring to look for in the mic's device name;
+MIC_NAME_HINT = "Microphone Array"   # substring to look for in the mic's device name;
                          # update this once you confirm the mic's real
                          # name from `python -c "import sounddevice as sd; print(sd.query_devices())"`
 RECORD_SAMPLE_RATE = 48000
@@ -74,7 +74,7 @@ GROQ_MODEL = "openai/gpt-oss-120b"   # confirmed production model — 20b is una
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # ——— TTS / SPEAKER SETTINGS ———
-PIPER_MODEL = "/home/jetson/ai-professor/voices/en_US-ryan-medium.onnx"
+PIPER_MODEL = "/home/jetson/ai-robot-project/voices/en_US-ryan-medium.onnx"
 AUDIO_DEVICE = "plughw:0,3"
 SPEECH_WAV = "/home/jetson/ai-professor/last_answer.wav"
 PIPER_LENGTH_SCALE = 1.2
@@ -284,7 +284,7 @@ class WhisperSession:
     def _load(self):
         from faster_whisper import WhisperModel
         print("[SETUP] Loading Whisper model...")
-        self.model = WhisperModel("small", device="cuda", compute_type="float16")
+        self.model = WhisperModel("small", device="cpu", compute_type="int8")
 
     def transcribe(self, audio, initial_prompt):
         self.count += 1
