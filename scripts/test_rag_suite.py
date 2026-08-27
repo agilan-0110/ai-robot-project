@@ -194,9 +194,12 @@ def run_tests():
     assert_test("clear_lecture() wipes conversation history", len(rag_engine._conversation_history) == 0)
     assert_test("has_lecture_loaded() returns False after clear", not rag_engine.has_lecture_loaded())
 
+    rate = (passed / total * 100) if total > 0 else 0.0
     print("\n" + "=" * 70)
-    print(f"TEST RESULTS: {passed}/{total} TESTS PASSED (100% SUCCESS RATE)")
+    print(f"TEST RESULTS: {passed}/{total} TESTS PASSED ({rate:.1f}% SUCCESS RATE)")
     print("=" * 70)
+    if passed != total:
+        sys.exit(1)
 
 if __name__ == "__main__":
     run_tests()
