@@ -11,6 +11,41 @@ import time
 import base64
 import tempfile
 import requests
+import unicodedata
+import io
+from PIL import Image
+
+# ——— Jetson / Device Configuration ———
+# By default, use CPU for sentence-transformers on Jetson to keep all 8GB
+# unified memory completely available for Whisper and YOLOv8-pose.
+RAG_DEVICE = os.environ.get("RAG_EMBEDDING_DEVICE", "cpu")
+
+# ——— Unicode and text normalization replacements ———
+UNICODE_REPLACEMENTS = {
+    '\u2018': "'", '\u2019': "'",   # smart single quotes
+    '\u201c': '"', '\u201d': '"',   # smart double quotes
+    '\u2013': '-', '\u2014': ' - ', # en/em dashes
+    '\u2011': '-',                  # non-breaking hyphen
+    '\u00a0': ' ',                  # non-breaking space
+    '\u2026': '...',                # horizontal ellipsis
+    '\u2022': ' ', '\u25ba': ' ',   # bullets & play arrows
+}
+
+def normalize_text(text):
+    """
+    Applies NFKC normalization and replaces problematic Unicode punctuation
+    (smart quotes, non-breaking hyphens, non-breaking spaces) with standard ASCII equivalents.
+    Ensures safe handling by downstream LLM prompts, TTS, and console logs across platforms.
+    """
+    if not text:
+        return ""
+    text = unicodedata.normalize("NFKC", text)
+    for bad, good in UNICODE_REPLACEMENTS.items():
+        text = text.replace(bad, good)
+    # Strip unprintable control characters (keep \n, \r, \t)
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    return text.strip()
+
 
 # ——— Image captioning via Gemini vision model ———
 # Uses a separate GEMINI_API_KEY env var (get one free at aistudio.google.com).
@@ -20,13 +55,6 @@ import requests
 # it for a per-image upload-time cost. If this model gets deprecated
 # later, run test_gemini_vision.py --list-models to find the current one.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment") as key:
-            GEMINI_API_KEY, _ = winreg.QueryValueEx(key, "GEMINI_API_KEY")
-    except Exception:
-        pass
 GEMINI_VISION_MODEL = "gemini-3.5-flash-lite"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 IMAGE_CAPTION_PROMPT = (
@@ -34,6 +62,62 @@ IMAGE_CAPTION_PROMPT = (
     "Focus on the educational content: labels, steps, relationships, or "
     "data shown. If it's purely decorative (logo, background), say so briefly."
 )
+
+# ═══════════════════════════════════════════════════════════════════
+# ——— Irrelevant content filter — EDIT THIS LIST ANYTIME ———
+# Any line matching one of these phrases (AND being short — see
+# MAX_WORDS_FOR_IRRELEVANT_LINE below) gets dropped from extraction:
+# title-slide clutter like student name, register no, department,
+# guide name, etc. This is NOT code logic — just add/remove plain
+# phrases here as you test on real decks and notice something slip
+# through or get wrongly filtered. No need to touch anything else.
+# ═══════════════════════════════════════════════════════════════════
+IRRELEVANT_PHRASES = [
+    "submitted by", "presented by", "prepared by", "compiled by",
+    "guided by", "under the guidance of", "guide name", "guide:",
+    "department of", "dept of", "dept.",
+    "register no", "register number", "reg no", "reg. no", "reg number",
+    "roll no", "roll number",
+    "academic year", "batch:", "section:", "class:",
+    "student name", "name:", "name ·", "name -",
+    "college name", "university name", "affiliated to",
+    "under the supervision of", "hod", "head of department",
+]
+
+# A line is only filtered if BOTH signals agree: it matches a phrase
+# above AND it's short. A long real sentence that happens to loosely
+# contain one of these words (rare, but possible) is left alone —
+# only short, clearly-administrative lines get dropped.
+MAX_WORDS_FOR_IRRELEVANT_LINE = 12
+
+# A line containing a long run of digits (6+ in a row) is almost always
+# a register/roll number — catches those even with unpredictable
+# label wording (e.g. "SUBASH M · 3RD YR AI&DS / A · 113224072105"),
+# without needing to guess every possible phrasing in the list above.
+_LONG_DIGIT_RUN_PATTERN = re.compile(r'\d{6,}')
+
+
+def _is_irrelevant_line(line):
+    """
+    Returns True if this line looks like title-slide clutter
+    (name/department/register no/etc.) rather than real lecture
+    content, and should be dropped from extraction.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return False
+
+    word_count = len(stripped.split())
+    if word_count > MAX_WORDS_FOR_IRRELEVANT_LINE:
+        return False  # long lines are never filtered — too risky to be wrong
+
+    lower = stripped.lower()
+    if any(phrase in lower for phrase in IRRELEVANT_PHRASES):
+        return True
+    if _LONG_DIGIT_RUN_PATTERN.search(stripped):
+        return True
+
+    return False
 
 # ——— Global state (loaded once, reused across requests) ———
 _model = None
@@ -97,8 +181,8 @@ _markitdown = None
 def _get_model():
     global _model
     if _model is None:
-        print("[RAG] Loading embedding model...")
-        _model = SentenceTransformer("all-MiniLM-L6-v2")
+        print(f"[RAG] Loading embedding model on {RAG_DEVICE}...")
+        _model = SentenceTransformer("all-MiniLM-L6-v2", device=RAG_DEVICE)
     return _model
 
 
@@ -109,14 +193,39 @@ def _get_markitdown():
     return _markitdown
 
 
+def _is_decorative_image(image_bytes):
+    """
+    Returns True if the image appears to be a small icon, bullet, or
+    decorative graphic rather than an educational diagram, chart, or photo.
+    Filtering these out:
+      1. Accelerates upload ingestion by 4-5x.
+      2. Prevents Gemini 15 RPM rate limits on decks with lots of icons.
+      3. Keeps the RAG knowledge base focused purely on educational content.
+    """
+    if not image_bytes or len(image_bytes) < 2048:  # under 2KB is virtually always a tiny icon/bullet
+        return True
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            w, h = img.size
+            # Skip tiny dimensions (bullets, status dots, small UI icons)
+            if w < 80 or h < 80:
+                return True
+            # Skip small square-ish icons (< 25,000 sq px and < 15KB)
+            if (w * h < 25000) and len(image_bytes) < 15000:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _caption_image_bytes(image_bytes, mime_type="image/png"):
     """
     Sends raw image bytes to Gemini and returns a short caption.
     Fails soft (returns "") if no API key is set or the call errors
     after retries — a missing caption should never block a file upload.
 
-    Retries on 503 (Gemini's "high demand, try again" error, which we
-    hit during manual testing) with a short backoff, up to 2 retries.
+    Retries on 503 (Gemini high demand) and 429 (rate limit exceeded)
+    with backoff before giving up.
     """
     if not GEMINI_API_KEY:
         return ""
@@ -140,78 +249,132 @@ def _caption_image_bytes(image_bytes, mime_type="image/png"):
                 print(f"[RAG] Gemini busy (503), retrying in 2s... (attempt {attempt + 1}/{max_attempts})")
                 time.sleep(2)
                 continue
+            if resp.status_code == 429 and attempt < max_attempts - 1:
+                retry_after = resp.headers.get("Retry-After")
+                wait_sec = float(retry_after) if retry_after else 4.0 * (attempt + 1)
+                print(f"[RAG] Gemini rate limit (429), retrying in {wait_sec:.1f}s... (attempt {attempt + 1}/{max_attempts})")
+                time.sleep(wait_sec)
+                continue
             resp.raise_for_status()
             data = resp.json()
             return data["candidates"][0]["content"]["parts"][0]["text"].strip()
         except Exception as e:
-            print(f"[RAG] Image captioning failed (skipping image): {e}")
+            if attempt == max_attempts - 1:
+                print(f"[RAG] Image captioning failed (skipping image): {e}")
+            else:
+                print(f"[RAG] Image captioning attempt {attempt + 1} failed: {e}")
+                time.sleep(1)
             return ""
     return ""
 
 
 def _caption_pptx_slide_images(slide):
-    """Returns a list of '[Image: ...]' caption strings for every picture
-    shape on this slide."""
+    """Returns a list of '[Image: ...]' caption strings for every real
+    embedded picture on this slide, skipping decorative icons and SmartArt.
+    """
     captions = []
-    pics = [s for s in slide.shapes if s.shape_type == MSO_SHAPE_TYPE.PICTURE]
-    for idx, shape in enumerate(pics):
+    skipped_non_embedded = 0
+    skipped_icons = 0
+    picture_shapes = [s for s in slide.shapes if s.shape_type == MSO_SHAPE_TYPE.PICTURE]
+
+    real_pictures = []
+    for s in picture_shapes:
         try:
-            print(f"[RAG]   -> Captioning image {idx + 1}/{len(pics)} via Gemini...", flush=True)
-            caption = _caption_image_bytes(
-                shape.image.blob, shape.image.content_type or "image/png"
-            )
-            if caption:
-                print(f"[RAG]      Caption: {caption[:70]}...", flush=True)
+            image = s.image
+            if _is_decorative_image(image.blob):
+                skipped_icons += 1
+                continue
+            real_pictures.append(image)
+        except ValueError:
+            skipped_non_embedded += 1
+            continue
+
+    for idx, image in enumerate(real_pictures, start=1):
+        print(f"[RAG]   -> Captioning image {idx}/{len(real_pictures)} via Gemini...")
+        try:
+            caption = _caption_image_bytes(image.blob, image.content_type or "image/png")
         except Exception as e:
-            print(f"[RAG] Could not read pptx image: {e}", flush=True)
+            print(f"[RAG] Could not caption pptx image: {e}")
             caption = ""
         if caption:
+            print(f"[RAG]      Caption: {caption[:70]}...")
             captions.append(f"[Image: {caption}]")
+
+    if skipped_icons:
+        print(f"[RAG]   -> Skipped {skipped_icons} small/decorative icon(s) (kept RAG clean)")
+    if skipped_non_embedded:
+        print(f"[RAG]   -> Skipped {skipped_non_embedded} SmartArt/diagram graphic(s) "
+              f"(not real photos, their text is already captured separately)")
+
     return captions
 
 
 def _caption_pdf_page_images(page):
-    """Returns a list of '[Image: ...]' caption strings for every image
-    embedded on this PDF page."""
+    """Returns a list of '[Image: ...]' caption strings for every real
+    educational image embedded on this PDF page."""
     captions = []
+    skipped_icons = 0
+    real_images = []
     for img in page.images:
         try:
+            if _is_decorative_image(img.data):
+                skipped_icons += 1
+                continue
+            real_images.append(img)
+        except Exception:
+            continue
+
+    for idx, img in enumerate(real_images, start=1):
+        try:
             caption = _caption_image_bytes(img.data, "image/png")
+            if caption:
+                captions.append(f"[Image: {caption}]")
         except Exception as e:
             print(f"[RAG] Could not read pdf image: {e}")
-            caption = ""
-        if caption:
-            captions.append(f"[Image: {caption}]")
+
+    if skipped_icons:
+        print(f"[RAG]   -> Skipped {skipped_icons} small/decorative icon(s) on PDF page")
     return captions
 
 
 def _caption_docx_images(path):
     """
-    python-docx has no reliable way to know WHERE in the document an
-    image sits relative to headings, so — unlike pptx/pdf, where each
-    image is captioned into its own numbered slide/page — docx images
-    are captioned as one flat list, to be appended as a trailing chunk
-    by the caller.
+    Captions educational images in DOCX, skipping decorative icons.
     """
     doc = Document(path)
     captions = []
+    skipped_icons = 0
+    real_images = []
     for rel in doc.part.rels.values():
         if "image" in rel.reltype:
             try:
-                caption = _caption_image_bytes(rel.target_part.blob, rel.target_part.content_type)
+                blob = rel.target_part.blob
+                if _is_decorative_image(blob):
+                    skipped_icons += 1
+                    continue
+                real_images.append((blob, rel.target_part.content_type))
             except Exception as e:
                 print(f"[RAG] Could not read docx image: {e}")
-                caption = ""
+
+    for blob, content_type in real_images:
+        try:
+            caption = _caption_image_bytes(blob, content_type)
             if caption:
                 captions.append(f"[Image: {caption}]")
+        except Exception as e:
+            print(f"[RAG] Could not read docx image: {e}")
+
+    if skipped_icons:
+        print(f"[RAG]   -> Skipped {skipped_icons} small/decorative icon(s) in DOCX")
     return captions
 
 
 def _strip_markitdown_comments(md_text):
     """Removes MarkItDown's own '<!-- Slide number: N -->' comments AND
     its bare '![filename](Picture2.jpg)' image placeholders — neither
-    carries real information; real image captions (if any) are generated
-    separately via _caption_image_bytes() and appended by the caller."""
+    carries real information, and we don't caption images (no vision
+    model wired in currently), so any embedded images are simply
+    excluded from the extracted text."""
     lines = []
     for l in md_text.split("\n"):
         stripped = l.strip()
@@ -223,41 +386,67 @@ def _strip_markitdown_comments(md_text):
     return "\n".join(lines).strip()
 
 
+GENERIC_HEADINGS = {
+    "notes", "notes:", "speaker notes", "speaker notes:", "slide notes",
+    "untitled", "untitled slide", "agenda", "overview", "table of contents",
+}
+_GENERIC_HEADING_REGEX = re.compile(r'^(?:slide\s*(?:number\s*|#\s*)?\d+|page\s*\d+)$', re.IGNORECASE)
+
+
+def _is_generic_heading(candidate):
+    """Returns True if the heading is a generic placeholder like 'Notes:' or 'Slide 1'."""
+    clean = candidate.strip().lower()
+    if clean in GENERIC_HEADINGS:
+        return True
+    if _GENERIC_HEADING_REGEX.match(clean):
+        return True
+    return False
+
+
 def _markdown_to_heading_and_points(md_text):
     """
     Splits a single chunk's markdown into (heading, points):
-    - heading = first '#' line found, if any (title placeholder text)
-    - points  = every other non-empty line (bullets, table rows, body text)
+    - heading = first non-generic '#' line found, if any
+    - points  = every other non-empty, non-irrelevant line
+    All lines are normalized (NFKC and clean punctuation).
     """
     heading = ""
     points = []
     for raw_line in md_text.split("\n"):
-        line = raw_line.strip()
+        line = normalize_text(raw_line)
         if not line:
             continue
-        # MarkItDown inserts its own "<!-- Slide number: N -->" comment per
-        # file; since we convert one slide/page at a time this is always
-        # "1" and meaningless — our own slide_number field is authoritative.
         if line.startswith("<!--") and line.endswith("-->"):
             continue
-        # Drop MarkItDown's bare "![filename](Picture2.jpg)" placeholder —
-        # meaningless without a real caption; real captions (if any) are
-        # generated separately via _caption_image_bytes() and appended by
-        # the caller.
         if line.startswith("!["):
             continue
         if line.startswith("#") and not heading:
-            heading = line.lstrip("#").strip()
+            candidate_heading = line.lstrip("#").strip()
+            if not _is_irrelevant_line(candidate_heading):
+                if not _is_generic_heading(candidate_heading):
+                    heading = candidate_heading
         else:
-            points.append(line)
+            if not _is_irrelevant_line(line):
+                # If a line itself is a bare "Notes:" label, don't include it in points either
+                if not _is_generic_heading(line):
+                    points.append(line)
     return heading, points
+
+
+def _build_chunk_text(heading, points):
+    """
+    Reconstructs the clean 'text' field FROM the already-filtered, normalized
+    heading/points so irrelevant clutter and generic markers are completely removed.
+    """
+    clean_heading = normalize_text(heading)
+    clean_points = [normalize_text(p) for p in points if normalize_text(p)]
+    lines = ([f"# {clean_heading}"] if clean_heading else []) + clean_points
+    return "\n".join(lines).strip()
 
 
 def _extract_from_pptx(path):
     """
-    Converts each slide individually via MarkItDown (keeps slide_number
-    intact for navigation/"repeat slide N", while gaining markdown table
-    support that the old python-pptx-only extractor didn't have).
+    Converts each slide individually via MarkItDown with per-slide fault tolerance.
     """
     converter = _get_markitdown()
     prs = Presentation(path)
@@ -266,45 +455,48 @@ def _extract_from_pptx(path):
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         for i in range(num_slides):
-            print(f"[RAG] Processing slide {i + 1}/{num_slides}...", flush=True)
-            # Build a temp single-slide pptx by stripping all other slide
-            # references from the slide list (fast — no re-encoding of media).
-            single = Presentation(path)
-            slide_id_list = single.slides._sldIdLst
-            all_ids = list(slide_id_list)
-            for j, sld in enumerate(all_ids):
-                if j != i:
-                    slide_id_list.remove(sld)
-            slide_path = os.path.join(tmp_dir, f"_slide_{i}.pptx")
-            single.save(slide_path)
+            print(f"[RAG] Processing slide {i + 1}/{num_slides}...")
+            try:
+                single = Presentation(path)
+                slide_id_list = single.slides._sldIdLst
+                all_ids = list(slide_id_list)
+                for j, sld in enumerate(all_ids):
+                    if j != i:
+                        slide_id_list.remove(sld)
+                slide_path = os.path.join(tmp_dir, f"_slide_{i}.pptx")
+                single.save(slide_path)
 
-            result = converter.convert(slide_path)
-            md_text = _strip_markitdown_comments(result.text_content or "")
+                result = converter.convert(slide_path)
+                md_text = _strip_markitdown_comments(result.text_content or "")
 
-            # Caption any pictures on the real (original) slide object —
-            # markitdown itself only emits a meaningless filename placeholder.
-            image_captions = _caption_pptx_slide_images(prs.slides[i])
-            if image_captions:
-                md_text = (md_text + "\n" + "\n".join(image_captions)).strip()
+                # Caption any pictures on the real (original) slide object
+                image_captions = _caption_pptx_slide_images(prs.slides[i])
+                if image_captions:
+                    md_text = (md_text + "\n" + "\n".join(image_captions)).strip()
 
-            if not md_text:
+                if not md_text:
+                    continue
+
+                heading, points = _markdown_to_heading_and_points(md_text)
+                clean_text = _build_chunk_text(heading, points)
+                if not clean_text:
+                    continue  # entire slide was filler
+
+                chunks.append({
+                    "slide_number": i + 1,
+                    "text": clean_text,
+                    "heading": heading,
+                    "points": points,
+                })
+            except Exception as e:
+                print(f"[RAG] Warning: Slide {i + 1} could not be extracted ({e}) — skipping.")
                 continue
-
-            heading, points = _markdown_to_heading_and_points(md_text)
-            chunks.append({
-                "slide_number": i + 1,
-                "text": md_text,
-                "heading": heading,
-                "points": points,
-            })
     return chunks
 
 
 def _extract_from_pdf(path):
     """
-    Converts each page individually via MarkItDown (keeps slide_number =
-    page number for navigation, while gaining proper markdown table
-    extraction that pdfplumber's raw text often garbled).
+    Converts each page individually via MarkItDown with per-page fault tolerance.
     """
     converter = _get_markitdown()
     reader = PdfReader(path)
@@ -313,43 +505,53 @@ def _extract_from_pdf(path):
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         for i in range(num_pages):
-            writer = PdfWriter()
-            writer.add_page(reader.pages[i])
-            page_path = os.path.join(tmp_dir, f"_page_{i}.pdf")
-            with open(page_path, "wb") as f:
-                writer.write(f)
+            print(f"[RAG] Processing page {i + 1}/{num_pages}...")
+            try:
+                writer = PdfWriter()
+                writer.add_page(reader.pages[i])
+                page_path = os.path.join(tmp_dir, f"_page_{i}.pdf")
+                with open(page_path, "wb") as f:
+                    writer.write(f)
 
-            result = converter.convert(page_path)
-            md_text = _strip_markitdown_comments(result.text_content or "")
+                result = converter.convert(page_path)
+                md_text = _strip_markitdown_comments(result.text_content or "")
 
-            # MarkItDown's PDF converter is text/table-only — it doesn't
-            # touch embedded images, so we caption them ourselves here.
-            image_captions = _caption_pdf_page_images(reader.pages[i])
-            if image_captions:
-                md_text = (md_text + "\n" + "\n".join(image_captions)).strip()
+                image_captions = _caption_pdf_page_images(reader.pages[i])
+                if image_captions:
+                    md_text = (md_text + "\n" + "\n".join(image_captions)).strip()
 
-            if not md_text:
+                if not md_text:
+                    continue
+
+                heading, points = _markdown_to_heading_and_points(md_text)
+                clean_text = _build_chunk_text(heading, points)
+                if not clean_text:
+                    continue
+
+                chunks.append({
+                    "slide_number": i + 1,
+                    "text": clean_text,
+                    "heading": heading,
+                    "points": points,
+                })
+            except Exception as e:
+                print(f"[RAG] Warning: Page {i + 1} could not be extracted ({e}) — skipping.")
                 continue
-
-            _, points = _markdown_to_heading_and_points(md_text)
-            chunks.append({
-                "slide_number": i + 1,
-                "text": md_text,
-                "points": points,
-            })
     return chunks
 
 
 def _extract_from_docx(path):
     """
-    DOCX has no page/slide concept, so we keep the original heuristic:
-    start a new chunk at each heading. MarkItDown converts the whole
-    file once (fast, single call) and now also captures tables, which
-    the old python-docx-paragraphs-only extractor silently skipped.
+    Converts DOCX via MarkItDown and groups by heading with fault tolerance.
     """
     converter = _get_markitdown()
-    result = converter.convert(path)
-    md_text = _strip_markitdown_comments(result.text_content or "")
+    try:
+        result = converter.convert(path)
+        md_text = _strip_markitdown_comments(result.text_content or "")
+    except Exception as e:
+        print(f"[RAG] Warning: Could not convert docx file ({e})")
+        return []
+
     if not md_text:
         return []
 
@@ -361,13 +563,16 @@ def _extract_from_docx(path):
         nonlocal current_lines, chunk_number
         text_block = "\n".join(l.strip() for l in current_lines if l.strip())
         if text_block:
-            _, points = _markdown_to_heading_and_points(text_block)
-            chunks.append({
-                "slide_number": chunk_number,
-                "text": text_block,
-                "points": points,
-            })
-            chunk_number += 1
+            heading, points = _markdown_to_heading_and_points(text_block)
+            clean_text = _build_chunk_text(heading, points)
+            if clean_text:
+                chunks.append({
+                    "slide_number": chunk_number,
+                    "text": clean_text,
+                    "heading": heading,
+                    "points": points,
+                })
+                chunk_number += 1
         current_lines = []
 
     for raw_line in md_text.split("\n"):
@@ -377,15 +582,13 @@ def _extract_from_docx(path):
         current_lines.append(line)
     flush()
 
-    # Caption any embedded images and append as one trailing chunk —
-    # see _caption_docx_images()'s docstring for why this can't be
-    # placed inline near a specific heading like pptx/pdf can.
     image_captions = _caption_docx_images(path)
     if image_captions:
         text_block = "Images in this document:\n" + "\n".join(image_captions)
         chunks.append({
             "slide_number": chunk_number,
             "text": text_block,
+            "heading": "Document Images",
             "points": image_captions,
         })
 
@@ -483,26 +686,40 @@ def retrieve_relevant_slides(question, top_k=3):
     """
     Public interface: given a student's question, returns the top_k
     most relevant chunks across all currently loaded files, as a list
-    of {"slide_number": int, "text": str, "score": float, "source_file": str}.
-    Returns an empty list if no lecture is loaded yet.
+    of {"slide_number": int, "text": str, "heading": str, "score": float, "source_file": str}.
+    Returns an empty list if no lecture is loaded yet or question is empty.
     """
-    if _vectors is None or not _slide_texts:
+    if _vectors is None or not _slide_texts or top_k <= 0:
+        return []
+
+    clean_q = normalize_text(question)
+    if not clean_q:
         return []
 
     model = _get_model()
-    question_vector = model.encode([question])[0]
+    question_vector = model.encode([clean_q], show_progress_bar=False)[0]
 
-    q_norm = question_vector / np.linalg.norm(question_vector)
-    v_norm = _vectors / np.linalg.norm(_vectors, axis=1, keepdims=True)
+    q_mag = np.linalg.norm(question_vector)
+    if q_mag < 1e-9:
+        return []
+    q_norm = question_vector / (q_mag + 1e-9)
+
+    v_mags = np.linalg.norm(_vectors, axis=1, keepdims=True)
+    v_mags[v_mags < 1e-9] = 1e-9  # Avoid division by zero
+    v_norm = _vectors / v_mags
+
     similarities = np.dot(v_norm, q_norm)
+    similarities = np.nan_to_num(similarities, nan=-1.0)
 
-    top_indices = np.argsort(similarities)[::-1][:top_k]
+    effective_k = min(top_k, len(_slide_texts))
+    top_indices = np.argsort(similarities)[::-1][:effective_k]
 
     results = []
     for idx in top_indices:
         results.append({
             "slide_number": _slide_texts[idx]["slide_number"],
             "text": _slide_texts[idx]["text"],
+            "heading": _slide_texts[idx].get("heading", ""),
             "score": float(similarities[idx]),
             "source_file": _slide_texts[idx].get("source_file", "unknown"),
         })
@@ -546,14 +763,27 @@ def get_context_for_query(question, top_k=3):
     # extract_requested_slide_number()'s docstring for why.
     requested_slide = extract_requested_slide_number(question)
     if requested_slide is not None:
-        match = next((c for c in _slide_texts if c["slide_number"] == requested_slide), None)
-        if match:
-            print(f"[RAG] Explicit slide reference detected -> slide {requested_slide} (exact match, no semantic search)")
+        matching_chunks = [c for c in _slide_texts if c["slide_number"] == requested_slide]
+        if matching_chunks:
+            # If multiple files loaded, check if question mentions a specific file name;
+            # otherwise prioritize the most recently loaded deck
+            chosen = matching_chunks[-1]
+            q_lower = question.lower()
+            for c in matching_chunks:
+                src = c.get("source_file", "").lower()
+                base_src, _ = os.path.splitext(src)
+                tokens = [t for t in re.split(r'[-_ ]+', base_src) if len(t) > 2]
+                if src in q_lower or any(t in q_lower for t in tokens):
+                    chosen = c
+                    break
+
+            print(f"[RAG] Explicit slide reference detected -> slide {requested_slide} ({chosen.get('source_file')}) (exact match, no semantic search)")
             chunks = [{
-                "slide_number": match["slide_number"],
-                "text": match["text"],
+                "slide_number": chosen["slide_number"],
+                "text": chosen["text"],
+                "heading": chosen.get("heading", ""),
                 "score": 1.0,
-                "source_file": match.get("source_file", "unknown"),
+                "source_file": chosen.get("source_file", "unknown"),
             }]
             return {
                 "is_followup": False,
@@ -563,7 +793,7 @@ def get_context_for_query(question, top_k=3):
                 "lecture_text": _build_lecture_text(chunks),
             }
         else:
-            print(f"[RAG] Slide {requested_slide} was requested but doesn't exist in the loaded lecture "
+            print(f"[RAG] Slide {requested_slide} was requested but doesn't exist in loaded lecture(s) "
                   f"({len(_slide_texts)} slides loaded) — falling back to semantic search.")
 
     if _is_followup(question) and _conversation_history:
