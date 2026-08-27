@@ -39,15 +39,66 @@ def run_tests():
     # -------------------------------------------------------------
     print("\n--- Suite 2: Generic Heading & Administrative Clutter Filter ---")
     assert_test("Detects 'Notes:' as generic heading", rag_engine._is_generic_heading("Notes:"))
-    assert_test("Detects 'Speaker Notes' as generic heading", rag_engine._is_generic_heading("Speaker Notes"))
+    assert_test("Detects '### Notes:' with hash prefix as generic heading", rag_engine._is_generic_heading("### Notes:"))
+    assert_test("Detects '## Speaker Notes' as generic heading", rag_engine._is_generic_heading("## Speaker Notes"))
     assert_test("Detects 'Slide 4' as generic heading", rag_engine._is_generic_heading("Slide 4"))
     assert_test("Allows valid concept heading 'Decision Making'", not rag_engine._is_generic_heading("Decision Making"))
     
-    # Test markdown conversion with # Notes:
+    # Test markdown conversion when # Notes: is at the top
     md_with_notes = "# Notes:\nLeadership Principles\nIntegrity\nAccountability"
     h, pts = rag_engine._markdown_to_heading_and_points(md_with_notes)
-    assert_test("Notes: suppressed as candidate heading", h == "" or h != "Notes:")
+    assert_test("Notes: suppressed as candidate heading when first", h == "" or h != "Notes:")
     assert_test("Notes: not leaked into body points", "Notes:" not in pts and "notes:" not in [p.lower() for p in pts])
+
+    # Test markdown conversion when real heading is first and ### Notes: appears later
+    md_subsequent_notes = "# Decision Making\nPoint 1\n### Notes:\nPoint 2\n### Accountability"
+    h2, pts2 = rag_engine._markdown_to_heading_and_points(md_subsequent_notes)
+    assert_test("Real heading preserved when ### Notes: is subsequent", h2 == "Decision Making")
+    assert_test("### Notes: dropped from points when subsequent", not any("notes" in p.lower() for p in pts2))
+    assert_test("Valid sub-heading ### Accountability kept as clean point", "Accountability" in pts2)
+
+    # -------------------------------------------------------------
+    # Test Suite 2B: Vision API Network Retry Loop Verification
+    # -------------------------------------------------------------
+    print("\n--- Suite 2B: Vision Captioning Retry Verification ---")
+    from unittest.mock import patch, MagicMock
+    import requests
+
+    # Test that transient network errors retry up to 3 times before succeeding
+    mock_resp_success = MagicMock()
+    mock_resp_success.status_code = 200
+    mock_resp_success.json.return_value = {
+        "candidates": [{"content": {"parts": [{"text": "Diagram showing architecture"}]}}]
+    }
+
+    with patch("requests.post") as mock_post:
+        # First call raises ConnectionError, second succeeds
+        mock_post.side_effect = [
+            requests.exceptions.ConnectionError("Connection reset"),
+            mock_resp_success
+        ]
+        # Temporarily ensure GEMINI_API_KEY is truthy for the test
+        orig_key = rag_engine.GEMINI_API_KEY
+        rag_engine.GEMINI_API_KEY = "test_key"
+        try:
+            caption = rag_engine._caption_image_bytes(b"dummy_bytes")
+            assert_test("Retries on network exception and gets caption", caption == "Diagram showing architecture")
+            assert_test("Made exactly 2 attempts before succeeding", mock_post.call_count == 2)
+        finally:
+            rag_engine.GEMINI_API_KEY = orig_key
+
+    # Test that when all 3 attempts fail, it exhausts retries without premature exit
+    with patch("requests.post") as mock_post:
+        mock_post.side_effect = requests.exceptions.Timeout("Read timeout")
+        orig_key = rag_engine.GEMINI_API_KEY
+        rag_engine.GEMINI_API_KEY = "test_key"
+        try:
+            caption = rag_engine._caption_image_bytes(b"dummy_bytes")
+            assert_test("Returns empty string after exhausting all 3 attempts", caption == "")
+            assert_test("Made all 3 attempts on continuous failure", mock_post.call_count == 3)
+        finally:
+            rag_engine.GEMINI_API_KEY = orig_key
+
 
     # -------------------------------------------------------------
     # Test Suite 3: Vector Math & Edge-Case Safety

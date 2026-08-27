@@ -260,11 +260,11 @@ def _caption_image_bytes(image_bytes, mime_type="image/png"):
             return data["candidates"][0]["content"]["parts"][0]["text"].strip()
         except Exception as e:
             if attempt == max_attempts - 1:
-                print(f"[RAG] Image captioning failed (skipping image): {e}")
-            else:
-                print(f"[RAG] Image captioning attempt {attempt + 1} failed: {e}")
-                time.sleep(1)
-            return ""
+                print(f"[RAG] Image captioning failed after {max_attempts} attempts (skipping image): {e}")
+                return ""
+            print(f"[RAG] Image captioning attempt {attempt + 1} failed ({e}), retrying in 1s...")
+            time.sleep(1)
+            continue
     return ""
 
 
@@ -394,8 +394,8 @@ _GENERIC_HEADING_REGEX = re.compile(r'^(?:slide\s*(?:number\s*|#\s*)?\d+|page\s*
 
 
 def _is_generic_heading(candidate):
-    """Returns True if the heading is a generic placeholder like 'Notes:' or 'Slide 1'."""
-    clean = candidate.strip().lower()
+    """Returns True if the heading is a generic placeholder like 'Notes:', '### Notes:', or 'Slide 1'."""
+    clean = candidate.lstrip("#").strip().lower()
     if clean in GENERIC_HEADINGS:
         return True
     if _GENERIC_HEADING_REGEX.match(clean):
@@ -422,14 +422,14 @@ def _markdown_to_heading_and_points(md_text):
             continue
         if line.startswith("#") and not heading:
             candidate_heading = line.lstrip("#").strip()
-            if not _is_irrelevant_line(candidate_heading):
-                if not _is_generic_heading(candidate_heading):
-                    heading = candidate_heading
+            if not _is_irrelevant_line(candidate_heading) and not _is_generic_heading(candidate_heading):
+                heading = candidate_heading
         else:
-            if not _is_irrelevant_line(line):
-                # If a line itself is a bare "Notes:" label, don't include it in points either
-                if not _is_generic_heading(line):
-                    points.append(line)
+            if _is_generic_heading(line):
+                continue
+            clean_line = line.lstrip("#").strip() if line.startswith("#") else line
+            if clean_line and not _is_irrelevant_line(clean_line) and not _is_generic_heading(clean_line):
+                points.append(clean_line)
     return heading, points
 
 
