@@ -6,18 +6,29 @@ from pypdf import PdfReader, PdfWriter
 from markitdown import MarkItDown
 import numpy as np
 import os
+import re
+import time
 import base64
 import tempfile
 import requests
 
-# ——— Image captioning via Groq vision model ———
-# Uses the same GROQ_API_KEY env var as orchestrator.py's text LLM calls.
-# NOTE: verify GROQ_VISION_MODEL is still current at
-# https://console.groq.com/docs/models before your demo — Groq's
-# available vision models change over time.
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
-GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+# ——— Image captioning via Gemini vision model ———
+# Uses a separate GEMINI_API_KEY env var (get one free at aistudio.google.com).
+# CONFIRMED WORKING (Aug 2026) via manual testing: gemini-3.5-flash-lite —
+# ~1.8s/image, good caption quality. The non-lite gemini-3.5-flash also
+# works but is ~10x slower (~17s/image) for similar quality — not worth
+# it for a per-image upload-time cost. If this model gets deprecated
+# later, run test_gemini_vision.py --list-models to find the current one.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment") as key:
+            GEMINI_API_KEY, _ = winreg.QueryValueEx(key, "GEMINI_API_KEY")
+    except Exception:
+        pass
+GEMINI_VISION_MODEL = "gemini-3.5-flash-lite"
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 IMAGE_CAPTION_PROMPT = (
     "Describe this lecture slide image or diagram in 1-2 sentences. "
     "Focus on the educational content: labels, steps, relationships, or "
@@ -43,6 +54,42 @@ _FOLLOWUP_PHRASES = [
     "explain more", "can you explain more", "i'm lost", "im lost",
 ]
 
+# ——— Explicit slide-number detection ———
+# Semantic (embedding) search has no real concept of "slide 5" — the
+# embedding of the literal words "explain slide 5" isn't reliably close
+# to whatever content actually lives on slide 5. So a direct question
+# like "explain slide 5" must be resolved by exact slide_number lookup,
+# not similarity search, or it ends up answering an unrelated slide.
+_WORD_TO_NUM = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+}
+_SLIDE_NUMBER_DIGIT_PATTERN = re.compile(r'slide\s*(?:number\s*|#\s*)?(\d+)', re.IGNORECASE)
+_SLIDE_NUMBER_WORD_PATTERN = re.compile(
+    r'slide\s*(?:number\s*)?(' + "|".join(_WORD_TO_NUM.keys()) + r')', re.IGNORECASE
+)
+
+
+def extract_requested_slide_number(text):
+    """
+    Returns the slide number explicitly mentioned in the text (as an int),
+    or None if no slide reference is found. Handles both digit form
+    ("slide 5") and spoken/word form ("slide five") — Whisper frequently
+    transcribes small spoken numbers as words rather than digits.
+    """
+    match = _SLIDE_NUMBER_DIGIT_PATTERN.search(text)
+    if match:
+        return int(match.group(1))
+
+    match = _SLIDE_NUMBER_WORD_PATTERN.search(text.lower())
+    if match:
+        return _WORD_TO_NUM.get(match.group(1))
+
+    return None
+
 
 _markitdown = None
 
@@ -64,49 +111,96 @@ def _get_markitdown():
 
 def _caption_image_bytes(image_bytes, mime_type="image/png"):
     """
-    Sends raw image bytes to a Groq vision model and returns a short
-    caption. Fails soft (returns "") if no API key is set or the call
-    errors — a missing caption should never block a file upload.
+    Sends raw image bytes to Gemini and returns a short caption.
+    Fails soft (returns "") if no API key is set or the call errors
+    after retries — a missing caption should never block a file upload.
+
+    Retries on 503 (Gemini's "high demand, try again" error, which we
+    hit during manual testing) with a short backoff, up to 2 retries.
     """
-    if not GROQ_API_KEY:
+    if not GEMINI_API_KEY:
         return ""
-    try:
-        b64 = base64.b64encode(image_bytes).decode("utf-8")
-        data_uri = f"data:{mime_type};base64,{b64}"
-        resp = requests.post(
-            GROQ_CHAT_URL,
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            json={
-                "model": GROQ_VISION_MODEL,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": IMAGE_CAPTION_PROMPT},
-                        {"type": "image_url", "image_url": {"url": data_uri}},
-                    ],
-                }],
-            },
-            timeout=20,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print(f"[RAG] Image captioning failed (skipping image): {e}")
-        return ""
+
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    url = f"{GEMINI_BASE_URL}/models/{GEMINI_VISION_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": IMAGE_CAPTION_PROMPT},
+                {"inline_data": {"mime_type": mime_type, "data": b64}},
+            ]
+        }]
+    }
+
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            resp = requests.post(url, json=payload, timeout=20)
+            if resp.status_code == 503 and attempt < max_attempts - 1:
+                print(f"[RAG] Gemini busy (503), retrying in 2s... (attempt {attempt + 1}/{max_attempts})")
+                time.sleep(2)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except Exception as e:
+            print(f"[RAG] Image captioning failed (skipping image): {e}")
+            return ""
+    return ""
 
 
 def _caption_pptx_slide_images(slide):
     """Returns a list of '[Image: ...]' caption strings for every picture
     shape on this slide."""
     captions = []
-    for shape in slide.shapes:
-        if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+    pics = [s for s in slide.shapes if s.shape_type == MSO_SHAPE_TYPE.PICTURE]
+    for idx, shape in enumerate(pics):
+        try:
+            print(f"[RAG]   -> Captioning image {idx + 1}/{len(pics)} via Gemini...", flush=True)
+            caption = _caption_image_bytes(
+                shape.image.blob, shape.image.content_type or "image/png"
+            )
+            if caption:
+                print(f"[RAG]      Caption: {caption[:70]}...", flush=True)
+        except Exception as e:
+            print(f"[RAG] Could not read pptx image: {e}", flush=True)
+            caption = ""
+        if caption:
+            captions.append(f"[Image: {caption}]")
+    return captions
+
+
+def _caption_pdf_page_images(page):
+    """Returns a list of '[Image: ...]' caption strings for every image
+    embedded on this PDF page."""
+    captions = []
+    for img in page.images:
+        try:
+            caption = _caption_image_bytes(img.data, "image/png")
+        except Exception as e:
+            print(f"[RAG] Could not read pdf image: {e}")
+            caption = ""
+        if caption:
+            captions.append(f"[Image: {caption}]")
+    return captions
+
+
+def _caption_docx_images(path):
+    """
+    python-docx has no reliable way to know WHERE in the document an
+    image sits relative to headings, so — unlike pptx/pdf, where each
+    image is captioned into its own numbered slide/page — docx images
+    are captioned as one flat list, to be appended as a trailing chunk
+    by the caller.
+    """
+    doc = Document(path)
+    captions = []
+    for rel in doc.part.rels.values():
+        if "image" in rel.reltype:
             try:
-                caption = _caption_image_bytes(
-                    shape.image.blob, shape.image.content_type or "image/png"
-                )
+                caption = _caption_image_bytes(rel.target_part.blob, rel.target_part.content_type)
             except Exception as e:
-                print(f"[RAG] Could not read pptx image: {e}")
+                print(f"[RAG] Could not read docx image: {e}")
                 caption = ""
             if caption:
                 captions.append(f"[Image: {caption}]")
@@ -172,6 +266,7 @@ def _extract_from_pptx(path):
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         for i in range(num_slides):
+            print(f"[RAG] Processing slide {i + 1}/{num_slides}...", flush=True)
             # Build a temp single-slide pptx by stripping all other slide
             # references from the slide list (fast — no re-encoding of media).
             single = Presentation(path)
@@ -227,18 +322,9 @@ def _extract_from_pdf(path):
             result = converter.convert(page_path)
             md_text = _strip_markitdown_comments(result.text_content or "")
 
-            # MarkItDown's PDF converter is text/table-only — it does not
-            # touch embedded images at all, so we extract + caption them
-            # ourselves here.
-            image_captions = []
-            for img in reader.pages[i].images:
-                try:
-                    caption = _caption_image_bytes(img.data, "image/png")
-                except Exception as e:
-                    print(f"[RAG] Could not read pdf image: {e}")
-                    caption = ""
-                if caption:
-                    image_captions.append(f"[Image: {caption}]")
+            # MarkItDown's PDF converter is text/table-only — it doesn't
+            # touch embedded images, so we caption them ourselves here.
+            image_captions = _caption_pdf_page_images(reader.pages[i])
             if image_captions:
                 md_text = (md_text + "\n" + "\n".join(image_captions)).strip()
 
@@ -291,22 +377,10 @@ def _extract_from_docx(path):
         current_lines.append(line)
     flush()
 
-    # python-docx has no reliable way to know WHERE in the document an
-    # image sits relative to headings, so — unlike pptx/pdf, where each
-    # image is captioned into its own numbered slide/page — docx images
-    # are captioned and appended as one trailing chunk rather than being
-    # placed inline near the right section.
-    doc = Document(path)
-    image_captions = []
-    for rel in doc.part.rels.values():
-        if "image" in rel.reltype:
-            try:
-                caption = _caption_image_bytes(rel.target_part.blob, rel.target_part.content_type)
-            except Exception as e:
-                print(f"[RAG] Could not read docx image: {e}")
-                caption = ""
-            if caption:
-                image_captions.append(f"[Image: {caption}]")
+    # Caption any embedded images and append as one trailing chunk —
+    # see _caption_docx_images()'s docstring for why this can't be
+    # placed inline near a specific heading like pptx/pdf can.
+    image_captions = _caption_docx_images(path)
     if image_captions:
         text_block = "Images in this document:\n" + "\n".join(image_captions)
         chunks.append({
@@ -467,6 +541,31 @@ def get_context_for_query(question, top_k=3):
     Public interface: the 'smart' entry point the orchestrator should
     call instead of retrieve_relevant_slides() directly.
     """
+    # Explicit "explain slide N" / "slide five" references must be
+    # resolved by exact lookup, not semantic search — see
+    # extract_requested_slide_number()'s docstring for why.
+    requested_slide = extract_requested_slide_number(question)
+    if requested_slide is not None:
+        match = next((c for c in _slide_texts if c["slide_number"] == requested_slide), None)
+        if match:
+            print(f"[RAG] Explicit slide reference detected -> slide {requested_slide} (exact match, no semantic search)")
+            chunks = [{
+                "slide_number": match["slide_number"],
+                "text": match["text"],
+                "score": 1.0,
+                "source_file": match.get("source_file", "unknown"),
+            }]
+            return {
+                "is_followup": False,
+                "chunks": chunks,
+                "previous_question": None,
+                "previous_answer": None,
+                "lecture_text": _build_lecture_text(chunks),
+            }
+        else:
+            print(f"[RAG] Slide {requested_slide} was requested but doesn't exist in the loaded lecture "
+                  f"({len(_slide_texts)} slides loaded) — falling back to semantic search.")
+
     if _is_followup(question) and _conversation_history:
         last = _conversation_history[-1]
         return {
