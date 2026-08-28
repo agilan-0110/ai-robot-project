@@ -125,6 +125,8 @@ _slide_texts = []   # each item also carries "source_file"
 _vectors = None
 _loaded_files = []  # list of file paths currently loaded (supports multiple)
 _conversation_history = []  # list of {"question", "answer", "chunks"} for this class session
+_current_lecture_slide = 0
+_max_slide_reached = 0
 
 _FOLLOWUP_PHRASES = [
     "explain again", "explain that again", "explain one more time",
@@ -687,6 +689,7 @@ def retrieve_relevant_slides(question, top_k=3):
     Public interface: given a student's question, returns the top_k
     most relevant chunks across all currently loaded files, as a list
     of {"slide_number": int, "text": str, "heading": str, "score": float, "source_file": str}.
+    When _max_slide_reached > 0, filters out any candidate slide where slide_number > _max_slide_reached.
     Returns an empty list if no lecture is loaded yet or question is empty.
     """
     if _vectors is None or not _slide_texts or top_k <= 0:
@@ -694,6 +697,14 @@ def retrieve_relevant_slides(question, top_k=3):
 
     clean_q = normalize_text(question)
     if not clean_q:
+        return []
+
+    # Filter candidate indices to only those slides covered so far (if lecture tracking is active)
+    valid_indices = [
+        i for i, c in enumerate(_slide_texts)
+        if _max_slide_reached <= 0 or c.get("slide_number", 0) <= _max_slide_reached
+    ]
+    if not valid_indices:
         return []
 
     model = _get_model()
@@ -704,24 +715,26 @@ def retrieve_relevant_slides(question, top_k=3):
         return []
     q_norm = question_vector / (q_mag + 1e-9)
 
-    v_mags = np.linalg.norm(_vectors, axis=1, keepdims=True)
+    candidate_vectors = _vectors[valid_indices]
+    v_mags = np.linalg.norm(candidate_vectors, axis=1, keepdims=True)
     v_mags[v_mags < 1e-9] = 1e-9  # Avoid division by zero
-    v_norm = _vectors / v_mags
+    v_norm = candidate_vectors / v_mags
 
     similarities = np.dot(v_norm, q_norm)
     similarities = np.nan_to_num(similarities, nan=-1.0)
 
-    effective_k = min(top_k, len(_slide_texts))
-    top_indices = np.argsort(similarities)[::-1][:effective_k]
+    effective_k = min(top_k, len(valid_indices))
+    top_sub_indices = np.argsort(similarities)[::-1][:effective_k]
 
     results = []
-    for idx in top_indices:
+    for sub_idx in top_sub_indices:
+        orig_idx = valid_indices[sub_idx]
         results.append({
-            "slide_number": _slide_texts[idx]["slide_number"],
-            "text": _slide_texts[idx]["text"],
-            "heading": _slide_texts[idx].get("heading", ""),
-            "score": float(similarities[idx]),
-            "source_file": _slide_texts[idx].get("source_file", "unknown"),
+            "slide_number": _slide_texts[orig_idx]["slide_number"],
+            "text": _slide_texts[orig_idx]["text"],
+            "heading": _slide_texts[orig_idx].get("heading", ""),
+            "score": float(similarities[sub_idx]),
+            "source_file": _slide_texts[orig_idx].get("source_file", "unknown"),
         })
     return results
 
@@ -765,6 +778,19 @@ def get_context_for_query(question, top_k=3):
     if requested_slide is not None:
         matching_chunks = [c for c in _slide_texts if c["slide_number"] == requested_slide]
         if matching_chunks:
+            # If the slide exists in the deck but hasn't been taught yet in the live lecture
+            if _max_slide_reached > 0 and requested_slide > _max_slide_reached:
+                print(f"[RAG] Slide {requested_slide} requested but has not been taught yet (max reached: {_max_slide_reached}).")
+                return {
+                    "is_followup": False,
+                    "not_covered_yet": True,
+                    "requested_slide": requested_slide,
+                    "chunks": [],
+                    "previous_question": None,
+                    "previous_answer": None,
+                    "lecture_text": f"Slide {requested_slide} has not been covered yet in today's lecture.",
+                }
+
             # If multiple files loaded, check if question mentions a specific file name;
             # otherwise prioritize the most recently loaded deck
             chosen = matching_chunks[-1]
@@ -787,6 +813,8 @@ def get_context_for_query(question, top_k=3):
             }]
             return {
                 "is_followup": False,
+                "not_covered_yet": False,
+                "requested_slide": requested_slide,
                 "chunks": chunks,
                 "previous_question": None,
                 "previous_answer": None,
@@ -800,6 +828,8 @@ def get_context_for_query(question, top_k=3):
         last = _conversation_history[-1]
         return {
             "is_followup": True,
+            "not_covered_yet": False,
+            "requested_slide": None,
             "chunks": last["chunks"],
             "previous_question": last["question"],
             "previous_answer": last["answer"],
@@ -809,6 +839,8 @@ def get_context_for_query(question, top_k=3):
     chunks = retrieve_relevant_slides(question, top_k=top_k)
     return {
         "is_followup": False,
+        "not_covered_yet": False,
+        "requested_slide": None,
         "chunks": chunks,
         "previous_question": None,
         "previous_answer": None,
@@ -836,11 +868,13 @@ def add_to_history(question, answer, chunks):
 
 def clear_lecture():
     """Public interface: wipes ALL currently loaded lecture files AND conversation history."""
-    global _slide_texts, _vectors, _loaded_files, _conversation_history
+    global _slide_texts, _vectors, _loaded_files, _conversation_history, _current_lecture_slide, _max_slide_reached
     _slide_texts = []
     _vectors = None
     _loaded_files = []
     _conversation_history = []
+    _current_lecture_slide = 0
+    _max_slide_reached = 0
     print("[RAG] Lecture(s) and conversation history cleared from memory.")
 
 
@@ -861,3 +895,33 @@ def get_ordered_chunks():
     returns only the top-k matches for a specific question).
     """
     return list(_slide_texts)
+
+
+def set_lecture_progress(current_slide, max_slide=None):
+    """
+    Public interface: tracks the main lecture's current position and max slide reached.
+    _current_lecture_slide only changes on 'next', never on doubt-detours.
+    _max_slide_reached only ever increases, never decreases.
+    """
+    global _current_lecture_slide, _max_slide_reached
+    _current_lecture_slide = current_slide
+    if max_slide is not None:
+        _max_slide_reached = max(_max_slide_reached, max_slide)
+    else:
+        _max_slide_reached = max(_max_slide_reached, current_slide)
+
+
+def get_lecture_progress():
+    """Public interface: returns (current_lecture_slide, max_slide_reached)."""
+    return _current_lecture_slide, _max_slide_reached
+
+
+def set_max_slide_reached(max_slide):
+    """Public interface: sets max_slide_reached directly."""
+    global _max_slide_reached
+    _max_slide_reached = max_slide
+
+
+def get_max_slide_reached():
+    """Public interface: gets max_slide_reached."""
+    return _max_slide_reached

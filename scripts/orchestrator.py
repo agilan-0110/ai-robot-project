@@ -79,6 +79,56 @@ AUDIO_DEVICE = "plughw:0,3"
 SPEECH_WAV = "/home/jetson/ai-professor/last_answer.wav"
 PIPER_LENGTH_SCALE = 1.2
 
+# ——— SLIDE COMPANION / PROJECTOR SETTINGS (Feature 1) ———
+SLIDE_COMPANION_HOST = os.environ.get("SLIDE_COMPANION_HOST", "127.0.0.1")
+SLIDE_COMPANION_PORT = int(os.environ.get("SLIDE_COMPANION_PORT", "5055"))
+
+
+class SlideClient:
+    """
+    Client for autonomous slide control on the teacher's laptop projector.
+    Sends 'next' and 'goto <N>' commands via HTTP to the companion script.
+    Retries up to 3 times with 1s backoff if no 'done' acknowledgment is received,
+    mirroring the retry pattern in rag_engine.py.
+    """
+    def __init__(self, host=SLIDE_COMPANION_HOST, port=SLIDE_COMPANION_PORT, timeout=3.0, max_retries=3):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.url = f"http://{self.host}:{self.port}/command"
+
+    def send_command(self, command, slide_number=None):
+        payload = {"command": command}
+        if slide_number is not None:
+            payload["slide"] = int(slide_number)
+
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                resp = requests.post(self.url, json=payload, timeout=self.timeout)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("status") == "done":
+                        print(f"[SLIDES] Successfully executed '{command}' (ack: done)")
+                        return True
+                print(f"[SLIDES] Attempt {attempt} returned status {resp.status_code}")
+            except Exception as e:
+                if attempt < self.max_retries:
+                    print(f"[SLIDES] Slide command '{command}' attempt {attempt} failed ({e}), retrying in 1s...")
+                    time.sleep(1)
+                else:
+                    print(f"[SLIDES] Slide command '{command}' failed after {self.max_retries} attempts ({e}).")
+        return False
+
+    def next_slide(self):
+        """Advances projector by exactly one slide."""
+        return self.send_command("next")
+
+    def goto_slide(self, slide_number):
+        """Jumps projector directly to slide_number."""
+        return self.send_command("goto", slide_number)
+
+
 # ——— MATHS NOTATION -> SPOKEN WORDS ———
 MATH_REPLACEMENTS = [
     (r'√\(([^)]+)\)', r'the square root of \1'),
@@ -367,6 +417,13 @@ def clean_for_speech(text):
 # matching the edge-case behaviour Subash already validated.
 # =====================================================================
 def get_llm_answer(question, context):
+    if context.get("not_covered_yet", False):
+        slide_num = context.get("requested_slide")
+        slide_ref = f"slide {slide_num}" if slide_num else "that slide"
+        ans = f"We haven't covered {slide_ref} yet in today's lecture. Let's continue with our current topic first, and we will get to that soon."
+        print(f"[THINKING] Answer (not covered yet): {ans}")
+        return ans
+
     if not GROQ_API_KEY:
         print("[THINKING] ERROR: GROQ_API_KEY not set.")
         return "Sorry, I can't reach my brain right now."
@@ -415,17 +472,17 @@ Student's question: {question}"""
                 "content": (
                     "You are a friendly professor speaking out loud to a student in a classroom. "
                     "Answer in natural, spoken, conversational sentences, the way a teacher would "
-                    "explain something to a student's face, not a written document. "
+                    "explain something to a student face-to-face, not a written document. "
+                    "Teach and elaborate on the answer thoroughly — unpack each key point with context, "
+                    "a brief relatable example, or why it matters. "
+                    "Aim for approximately 120-150 words (about 45-60 seconds of spoken explanation) "
+                    "so the student receives a complete, clear understanding. "
                     "Never use bullet points, numbered lists, markdown formatting, headers, or bold text. "
                     "Just plain flowing sentences, as if you were talking. "
-                    "When explaining maths, never use symbols like ^, √, ≠, ÷, π, ∫, or fractions "
+                    "When explaining maths, never use math symbols like ^, √, ≠, ÷, π, ∫, or fractions "
                     "written as a/b — always write them out in plain spoken words instead "
                     "(e.g. 'x squared', 'the square root of 16', 'three over four', 'pi'), "
                     "exactly the way you'd say them out loud to a student. "
-                    "If the question is broad or asks for 'everything' about a big topic, do NOT try to "
-                    "cover it all at once — give a short, clear overview of the most important idea first, "
-                    "then ask if the student wants you to go deeper on any specific part. "
-                    "Keep it to 2-4 short sentences unless the question truly needs more depth. "
                     "Be warm and encouraging, like a good teacher."
                 )
             },
@@ -553,9 +610,77 @@ def is_next_slide_intent(text):
     return any(p in t for p in NEXT_SLIDE_PHRASES)
 
 
+def extract_image_captions_if_image_only(slide_text):
+    """
+    Returns a list of caption strings if the slide contains ONLY image caption(s)
+    (and optional slide heading, but NO real bullet text).
+    Returns None if the slide contains regular bullet points or text.
+    """
+    lines = [l.strip() for l in slide_text.strip().split("\n") if l.strip()]
+    if not lines:
+        return None
+
+    captions = []
+    has_image = False
+    has_text_bullets = False
+
+    for l in lines:
+        if l.startswith("#"):
+            continue  # slide heading is allowed
+        m = re.match(r'^\[Image:\s*(.*)\]$', l)
+        if m:
+            has_image = True
+            captions.append(m.group(1).strip())
+        else:
+            has_text_bullets = True
+
+    if has_image and not has_text_bullets:
+        return captions
+    return None
+
+
+def build_slide_explanation_prompt(slide_text):
+    """
+    Builds the (system_prompt, user_content) pair for slide explanation.
+    Handles image-only caption slides (Feature 3) and elaborate explanation framing (Feature 4).
+    """
+    system_prompt = (
+        "You are a friendly professor teaching a live class out loud. "
+        "Teach and elaborate on the slide content thoroughly in natural, spoken prose, "
+        "the way a great teacher explains concepts face-to-face to students. "
+        "Unpack each key idea with necessary context, explain why it matters, "
+        "and provide a clear, relatable example to help the concept land. "
+        "Use the slide's own key terms and facts — do not invent claims or contradict the material. "
+        "Aim for approximately 120-150 words (about 45-60 seconds of spoken explanation) "
+        "so students get a complete, well-elaborated understanding. "
+        "Never use bullet points, numbered lists, markdown formatting, headers, or bold text. "
+        "When explaining maths, never use math symbols (like ^, √, ≠, ÷, π, ∫) or fractions written as a/b — "
+        "always write them out in plain spoken words (e.g. 'x squared', 'the square root of sixteen'). "
+        "Do not greet or introduce yourself, just begin teaching and elaborating on the topic directly."
+    )
+
+    captions = extract_image_captions_if_image_only(slide_text)
+    if captions:
+        caption_desc = " ".join(captions)
+        heading_match = re.search(r'^\s*#+\s*(.+)$', slide_text, re.MULTILINE)
+        heading_prefix = f"Slide Topic: {heading_match.group(1).strip()}\n" if heading_match else ""
+        user_content = (
+            f"{heading_prefix}This slide has no text content, only an image. "
+            f"Here is a description of that image: {caption_desc}. "
+            f"Explain the slide's topic based on this description."
+        )
+    else:
+        user_content = f"Slide content:\n{slide_text}"
+
+    return system_prompt, user_content
+
+
 def generate_slide_explanation(slide_text):
     if not GROQ_API_KEY:
         return "Sorry, I can't reach my brain right now."
+
+    system_prompt, user_content = build_slide_explanation_prompt(slide_text)
+
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
@@ -563,23 +688,11 @@ def generate_slide_explanation(slide_text):
     payload = {
         "model": GROQ_MODEL,
         "messages": [
-            {"role": "system", "content": (
-                "You are a friendly professor teaching a live class out loud. "
-                "You will be given the raw content of one lecture slide. "
-                "First, clearly state the actual point(s) from the slide using "
-                "the slide's own key terms and facts — do not invent numbers, "
-                "claims, or details that aren't in the slide content. "
-                "After stating the real content, you may add ONE short relatable "
-                "example to help it land, but the example must not replace or "
-                "contradict the actual facts from the slide. "
-                "Never use bullet points, markdown, or headers, just speak naturally. "
-                "Keep it to 3-5 sentences total. Do not greet or introduce yourself, "
-                "just explain the slide content directly."
-            )},
-            {"role": "user", "content": f"Slide content:\n{slide_text}"},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
         ],
         "temperature": 0.7,
-        "max_tokens": 400,
+        "max_tokens": 600,
     }
     try:
         response = requests.post(GROQ_URL, headers=headers, json=payload, timeout=15)
@@ -722,7 +835,10 @@ def answer_doubt_about_slide(slide, question):
     return get_llm_answer(question, context)
 
 
-def teach_class(whisper_session, piper_voice, initial_prompt, mic_index, lecture_path):
+def teach_class(whisper_session, piper_voice, initial_prompt, mic_index, lecture_path, slide_client=None):
+    if slide_client is None:
+        slide_client = SlideClient()
+
     slides = rag_engine.get_ordered_chunks()
     if not slides:
         print("[TEACHING] No lecture loaded, nothing to teach.")
@@ -733,6 +849,13 @@ def teach_class(whisper_session, piper_voice, initial_prompt, mic_index, lecture
     # brand new (and possibly different, or wrong-slide) answer each time.
     start_index, slide_explanations, slide_qa_history = load_checkpoint(lecture_path)
 
+    current_lecture_slide = 0
+    max_slide_reached = 0
+    if start_index > 0 and start_index <= len(slides):
+        current_lecture_slide = slides[start_index - 1]["slide_number"]
+        max_slide_reached = current_lecture_slide
+        rag_engine.set_lecture_progress(current_lecture_slide, max_slide_reached)
+
     print(f"[TEACHING] Starting class, {len(slides)} slides queued.")
     for i, slide in enumerate(slides):
         if i < start_index:
@@ -740,6 +863,14 @@ def teach_class(whisper_session, piper_voice, initial_prompt, mic_index, lecture
 
         current_number = slide["slide_number"]
         print(f"[TEACHING] Slide {current_number} ({i+1}/{len(slides)})")
+
+        # FEATURE 1: Timing — 'next' must fire BEFORE the robot starts narrating the new slide
+        slide_client.next_slide()
+
+        # Update main lecture position (only changed by 'next', never by doubt detours)
+        current_lecture_slide = current_number
+        max_slide_reached = max(max_slide_reached, current_number)
+        rag_engine.set_lecture_progress(current_lecture_slide, max_slide_reached)
 
         explanation = generate_slide_explanation(slide["text"])
         speak_answer(piper_voice, explanation)
@@ -764,6 +895,8 @@ def teach_class(whisper_session, piper_voice, initial_prompt, mic_index, lecture
             if is_previous_slide_request(response):
                 if i > 0:
                     prev_number = slides[i - 1]["slide_number"]
+                    # Doubt detour to previous slide
+                    slide_client.goto_slide(prev_number)
                     if prev_number in slide_explanations:
                         print(f"[TEACHING] Replaying previous slide {prev_number} verbatim.")
                         speak_answer(piper_voice, slide_explanations[prev_number])
@@ -772,6 +905,8 @@ def teach_class(whisper_session, piper_voice, initial_prompt, mic_index, lecture
                         explanation = generate_slide_explanation(prev_slide["text"])
                         slide_explanations[prev_number] = explanation
                         speak_answer(piper_voice, explanation)
+                    # Return to current slide after detour
+                    slide_client.goto_slide(current_lecture_slide)
                 else:
                     speak_answer(piper_voice, "This is already the first slide.")
                 continue
@@ -788,16 +923,35 @@ def teach_class(whisper_session, piper_voice, initial_prompt, mic_index, lecture
 
             requested_slide = extract_requested_slide_number(response)
             if requested_slide is not None:
-                if requested_slide in slide_explanations:
-                    print(f"[TEACHING] Replaying stored explanation for slide {requested_slide} verbatim.")
-                    speak_answer(piper_voice, slide_explanations[requested_slide])
-                else:
-                    target = next((s for s in slides if s["slide_number"] == requested_slide), None)
-                    if target:
-                        print(f"[TEACHING] Slide {requested_slide} requested directly (not yet taught) — explaining now.")
-                        explanation = generate_slide_explanation(target["text"])
+                if requested_slide == current_lecture_slide:
+                    # On current slide: replay or explain without moving projector
+                    if requested_slide in slide_explanations:
+                        print(f"[TEACHING] Replaying stored explanation for slide {requested_slide} verbatim.")
+                        speak_answer(piper_voice, slide_explanations[requested_slide])
+                    else:
+                        explanation = generate_slide_explanation(slide["text"])
                         slide_explanations[requested_slide] = explanation
                         speak_answer(piper_voice, explanation)
+                elif requested_slide <= max_slide_reached:
+                    # Detour to earlier covered slide: goto N -> explain -> goto current_lecture_slide
+                    slide_client.goto_slide(requested_slide)
+                    if requested_slide in slide_explanations:
+                        print(f"[TEACHING] Replaying stored explanation for slide {requested_slide} verbatim.")
+                        speak_answer(piper_voice, slide_explanations[requested_slide])
+                    else:
+                        target = next((s for s in slides if s["slide_number"] == requested_slide), None)
+                        if target:
+                            explanation = generate_slide_explanation(target["text"])
+                            slide_explanations[requested_slide] = explanation
+                            speak_answer(piper_voice, explanation)
+                    # Return to current slide after detour
+                    slide_client.goto_slide(current_lecture_slide)
+                else:
+                    # N > max_slide_reached: do NOT send goto command
+                    target = next((s for s in slides if s["slide_number"] == requested_slide), None)
+                    if target:
+                        print(f"[TEACHING] Slide {requested_slide} requested but not covered yet (max reached: {max_slide_reached}).")
+                        speak_answer(piper_voice, f"We haven't covered slide {requested_slide} yet. Let's continue with today's lecture first.")
                     else:
                         speak_answer(piper_voice, f"I don't have slide {requested_slide} in this lecture.")
                 continue
