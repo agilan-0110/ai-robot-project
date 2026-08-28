@@ -17,3 +17,7 @@ pypdf
 python-docx
 markitdown
 Pillow
+pypdfium2
+langgraph
+edge-tts
+pynput
