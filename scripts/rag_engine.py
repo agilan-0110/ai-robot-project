@@ -14,6 +14,17 @@ import requests
 import unicodedata
 import io
 from PIL import Image
+from dotenv import load_dotenv
+
+# ——— Load .env explicitly ———
+# rag_engine.py lives in ~/ai-professor/scripts/, and .env lives one
+# level up at ~/ai-professor/.env. Loading it explicitly here (rather
+# than relying on the shell already having exported it) is what fixes
+# the slide-skipping bug: GEMINI_API_KEY was silently absent from the
+# orchestrator's runtime environment, which made every image-only slide
+# produce an empty md_text and get dropped with no visible error.
+_ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
+load_dotenv(dotenv_path=_ENV_PATH)
 
 # ——— Jetson / Device Configuration ———
 # By default, use CPU for sentence-transformers on Jetson to keep all 8GB
@@ -45,7 +56,6 @@ def normalize_text(text):
     # Strip unprintable control characters (keep \n, \r, \t)
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
     return text.strip()
-
 
 # ——— Image captioning via Gemini vision model ———
 # Uses a separate GEMINI_API_KEY env var (get one free at aistudio.google.com).
@@ -96,7 +106,6 @@ MAX_WORDS_FOR_IRRELEVANT_LINE = 12
 # without needing to guess every possible phrasing in the list above.
 _LONG_DIGIT_RUN_PATTERN = re.compile(r'\d{6,}')
 
-
 def _is_irrelevant_line(line):
     """
     Returns True if this line looks like title-slide clutter
@@ -106,17 +115,14 @@ def _is_irrelevant_line(line):
     stripped = line.strip()
     if not stripped:
         return False
-
     word_count = len(stripped.split())
     if word_count > MAX_WORDS_FOR_IRRELEVANT_LINE:
         return False  # long lines are never filtered — too risky to be wrong
-
     lower = stripped.lower()
     if any(phrase in lower for phrase in IRRELEVANT_PHRASES):
         return True
     if _LONG_DIGIT_RUN_PATTERN.search(stripped):
         return True
-
     return False
 
 # ——— Global state (loaded once, reused across requests) ———
@@ -158,7 +164,6 @@ _SLIDE_NUMBER_WORD_PATTERN = re.compile(
     r'slide\s*(?:number\s*)?(' + "|".join(_WORD_TO_NUM.keys()) + r')', re.IGNORECASE
 )
 
-
 def extract_requested_slide_number(text):
     """
     Returns the slide number explicitly mentioned in the text (as an int),
@@ -169,16 +174,12 @@ def extract_requested_slide_number(text):
     match = _SLIDE_NUMBER_DIGIT_PATTERN.search(text)
     if match:
         return int(match.group(1))
-
     match = _SLIDE_NUMBER_WORD_PATTERN.search(text.lower())
     if match:
         return _WORD_TO_NUM.get(match.group(1))
-
     return None
 
-
 _markitdown = None
-
 
 def _get_model():
     global _model
@@ -187,13 +188,11 @@ def _get_model():
         _model = SentenceTransformer("all-MiniLM-L6-v2", device=RAG_DEVICE)
     return _model
 
-
 def _get_markitdown():
     global _markitdown
     if _markitdown is None:
         _markitdown = MarkItDown()
     return _markitdown
-
 
 def _is_decorative_image(image_bytes):
     """
@@ -219,19 +218,16 @@ def _is_decorative_image(image_bytes):
         pass
     return False
 
-
 def _caption_image_bytes(image_bytes, mime_type="image/png"):
     """
     Sends raw image bytes to Gemini and returns a short caption.
     Fails soft (returns "") if no API key is set or the call errors
     after retries — a missing caption should never block a file upload.
-
     Retries on 503 (Gemini high demand) and 429 (rate limit exceeded)
     with backoff before giving up.
     """
     if not GEMINI_API_KEY:
         return ""
-
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     url = f"{GEMINI_BASE_URL}/models/{GEMINI_VISION_MODEL}:generateContent?key={GEMINI_API_KEY}"
     payload = {
@@ -242,7 +238,6 @@ def _caption_image_bytes(image_bytes, mime_type="image/png"):
             ]
         }]
     }
-
     max_attempts = 3
     for attempt in range(max_attempts):
         try:
@@ -269,7 +264,6 @@ def _caption_image_bytes(image_bytes, mime_type="image/png"):
             continue
     return ""
 
-
 def _caption_pptx_slide_images(slide):
     """Returns a list of '[Image: ...]' caption strings for every real
     embedded picture on this slide, skipping decorative icons and SmartArt.
@@ -278,7 +272,6 @@ def _caption_pptx_slide_images(slide):
     skipped_non_embedded = 0
     skipped_icons = 0
     picture_shapes = [s for s in slide.shapes if s.shape_type == MSO_SHAPE_TYPE.PICTURE]
-
     real_pictures = []
     for s in picture_shapes:
         try:
@@ -290,7 +283,6 @@ def _caption_pptx_slide_images(slide):
         except ValueError:
             skipped_non_embedded += 1
             continue
-
     for idx, image in enumerate(real_pictures, start=1):
         print(f"[RAG]   -> Captioning image {idx}/{len(real_pictures)} via Gemini...")
         try:
@@ -301,15 +293,12 @@ def _caption_pptx_slide_images(slide):
         if caption:
             print(f"[RAG]      Caption: {caption[:70]}...")
             captions.append(f"[Image: {caption}]")
-
     if skipped_icons:
         print(f"[RAG]   -> Skipped {skipped_icons} small/decorative icon(s) (kept RAG clean)")
     if skipped_non_embedded:
         print(f"[RAG]   -> Skipped {skipped_non_embedded} SmartArt/diagram graphic(s) "
               f"(not real photos, their text is already captured separately)")
-
     return captions
-
 
 def _caption_pdf_page_images(page):
     """Returns a list of '[Image: ...]' caption strings for every real
@@ -325,7 +314,6 @@ def _caption_pdf_page_images(page):
             real_images.append(img)
         except Exception:
             continue
-
     for idx, img in enumerate(real_images, start=1):
         try:
             caption = _caption_image_bytes(img.data, "image/png")
@@ -333,11 +321,9 @@ def _caption_pdf_page_images(page):
                 captions.append(f"[Image: {caption}]")
         except Exception as e:
             print(f"[RAG] Could not read pdf image: {e}")
-
     if skipped_icons:
         print(f"[RAG]   -> Skipped {skipped_icons} small/decorative icon(s) on PDF page")
     return captions
-
 
 def _caption_docx_images(path):
     """
@@ -357,7 +343,6 @@ def _caption_docx_images(path):
                 real_images.append((blob, rel.target_part.content_type))
             except Exception as e:
                 print(f"[RAG] Could not read docx image: {e}")
-
     for blob, content_type in real_images:
         try:
             caption = _caption_image_bytes(blob, content_type)
@@ -365,11 +350,9 @@ def _caption_docx_images(path):
                 captions.append(f"[Image: {caption}]")
         except Exception as e:
             print(f"[RAG] Could not read docx image: {e}")
-
     if skipped_icons:
         print(f"[RAG]   -> Skipped {skipped_icons} small/decorative icon(s) in DOCX")
     return captions
-
 
 def _strip_markitdown_comments(md_text):
     """Removes MarkItDown's own '<!-- Slide number: N -->' comments AND
@@ -387,13 +370,11 @@ def _strip_markitdown_comments(md_text):
         lines.append(l)
     return "\n".join(lines).strip()
 
-
 GENERIC_HEADINGS = {
     "notes", "notes:", "speaker notes", "speaker notes:", "slide notes",
     "untitled", "untitled slide", "agenda", "overview", "table of contents",
 }
 _GENERIC_HEADING_REGEX = re.compile(r'^(?:slide\s*(?:number\s*|#\s*)?\d+|page\s*\d+)$', re.IGNORECASE)
-
 
 def _is_generic_heading(candidate):
     """Returns True if the heading is a generic placeholder like 'Notes:', '### Notes:', or 'Slide 1'."""
@@ -403,7 +384,6 @@ def _is_generic_heading(candidate):
     if _GENERIC_HEADING_REGEX.match(clean):
         return True
     return False
-
 
 def _markdown_to_heading_and_points(md_text):
     """
@@ -434,7 +414,6 @@ def _markdown_to_heading_and_points(md_text):
                 points.append(clean_line)
     return heading, points
 
-
 def _build_chunk_text(heading, points):
     """
     Reconstructs the clean 'text' field FROM the already-filtered, normalized
@@ -445,7 +424,6 @@ def _build_chunk_text(heading, points):
     lines = ([f"# {clean_heading}"] if clean_heading else []) + clean_points
     return "\n".join(lines).strip()
 
-
 def _extract_from_pptx(path):
     """
     Converts each slide individually via MarkItDown with per-slide fault tolerance.
@@ -454,7 +432,6 @@ def _extract_from_pptx(path):
     prs = Presentation(path)
     num_slides = len(prs.slides)
     chunks = []
-
     with tempfile.TemporaryDirectory() as tmp_dir:
         for i in range(num_slides):
             print(f"[RAG] Processing slide {i + 1}/{num_slides}...")
@@ -467,23 +444,20 @@ def _extract_from_pptx(path):
                         slide_id_list.remove(sld)
                 slide_path = os.path.join(tmp_dir, f"_slide_{i}.pptx")
                 single.save(slide_path)
-
                 result = converter.convert(slide_path)
                 md_text = _strip_markitdown_comments(result.text_content or "")
-
                 # Caption any pictures on the real (original) slide object
                 image_captions = _caption_pptx_slide_images(prs.slides[i])
                 if image_captions:
                     md_text = (md_text + "\n" + "\n".join(image_captions)).strip()
-
                 if not md_text:
+                    print(f"[RAG][SKIP] Slide {i + 1}: no extractable text or captions — dropped.")
                     continue
-
                 heading, points = _markdown_to_heading_and_points(md_text)
                 clean_text = _build_chunk_text(heading, points)
                 if not clean_text:
+                    print(f"[RAG][SKIP] Slide {i + 1}: content was filtered out entirely (all lines looked like title-slide clutter) — dropped.")
                     continue  # entire slide was filler
-
                 chunks.append({
                     "slide_number": i + 1,
                     "text": clean_text,
@@ -495,7 +469,6 @@ def _extract_from_pptx(path):
                 continue
     return chunks
 
-
 def _extract_from_pdf(path):
     """
     Converts each page individually via MarkItDown with per-page fault tolerance.
@@ -504,7 +477,6 @@ def _extract_from_pdf(path):
     reader = PdfReader(path)
     num_pages = len(reader.pages)
     chunks = []
-
     with tempfile.TemporaryDirectory() as tmp_dir:
         for i in range(num_pages):
             print(f"[RAG] Processing page {i + 1}/{num_pages}...")
@@ -514,22 +486,19 @@ def _extract_from_pdf(path):
                 page_path = os.path.join(tmp_dir, f"_page_{i}.pdf")
                 with open(page_path, "wb") as f:
                     writer.write(f)
-
                 result = converter.convert(page_path)
                 md_text = _strip_markitdown_comments(result.text_content or "")
-
                 image_captions = _caption_pdf_page_images(reader.pages[i])
                 if image_captions:
                     md_text = (md_text + "\n" + "\n".join(image_captions)).strip()
-
                 if not md_text:
+                    print(f"[RAG][SKIP] Page {i + 1}: no extractable text or captions — dropped.")
                     continue
-
                 heading, points = _markdown_to_heading_and_points(md_text)
                 clean_text = _build_chunk_text(heading, points)
                 if not clean_text:
+                    print(f"[RAG][SKIP] Page {i + 1}: content was filtered out entirely (all lines looked like title-slide clutter) — dropped.")
                     continue
-
                 chunks.append({
                     "slide_number": i + 1,
                     "text": clean_text,
@@ -540,7 +509,6 @@ def _extract_from_pdf(path):
                 print(f"[RAG] Warning: Page {i + 1} could not be extracted ({e}) — skipping.")
                 continue
     return chunks
-
 
 def _extract_from_docx(path):
     """
@@ -553,10 +521,8 @@ def _extract_from_docx(path):
     except Exception as e:
         print(f"[RAG] Warning: Could not convert docx file ({e})")
         return []
-
     if not md_text:
         return []
-
     chunks = []
     current_lines = []
     chunk_number = 1
@@ -593,9 +559,7 @@ def _extract_from_docx(path):
             "heading": "Document Images",
             "points": image_captions,
         })
-
     return chunks
-
 
 def _extract_text(path):
     ext = os.path.splitext(path)[1].lower()
@@ -608,32 +572,25 @@ def _extract_text(path):
     else:
         raise ValueError(f"Unsupported file type: {ext}")
 
-
 def load_lecture(file_path, append=False):
     """
     Public interface: processes a lecture file (pptx/pdf/docx) into
     embeddings, held in memory for retrieval.
-
     append=False: replaces whatever was loaded before.
     append=True: adds this file's content alongside whatever is
         already loaded (multiple files in one class session).
     """
     global _slide_texts, _vectors, _loaded_files, _conversation_history
-
     print(f"[RAG] Loading lecture: {file_path} (append={append})")
     chunks = _extract_text(file_path)
-
     if not chunks:
         raise ValueError("No text could be extracted from this file.")
-
     source_name = os.path.basename(file_path)
     for c in chunks:
         c["source_file"] = source_name
-
     model = _get_model()
     texts = [c["text"] for c in chunks]
     new_vectors = model.encode(texts, show_progress_bar=False)
-
     if append and _vectors is not None:
         _slide_texts = _slide_texts + chunks
         _vectors = np.vstack([_vectors, new_vectors])
@@ -643,11 +600,9 @@ def load_lecture(file_path, append=False):
         _vectors = new_vectors
         _loaded_files = [file_path]
         _conversation_history = []  # fresh class, fresh memory (only on non-append load)
-
     print(f"[RAG] Loaded {len(chunks)} chunks from {source_name} "
           f"(total chunks now: {len(_slide_texts)})")
     return len(chunks)
-
 
 def remove_file(file_path):
     """
@@ -655,40 +610,31 @@ def remove_file(file_path):
     from memory without touching any other loaded files. Does NOT
     touch conversation history (a past answer stays valid even if
     the source file is later removed).
-
     Returns True if the file was found and removed, False otherwise.
     """
     global _slide_texts, _vectors, _loaded_files
-
     if file_path not in _loaded_files:
         return False
-
     source_name = os.path.basename(file_path)
-
     # build a mask of which chunks/vectors to KEEP (i.e. NOT from this file)
     keep_indices = [
         i for i, c in enumerate(_slide_texts)
         if c.get("source_file") != source_name
     ]
-
     if keep_indices:
         _slide_texts = [_slide_texts[i] for i in keep_indices]
         _vectors = _vectors[keep_indices]
     else:
         _slide_texts = []
         _vectors = None
-
     _loaded_files = [f for f in _loaded_files if f != file_path]
-
     try:
         import slide_renderer
         slide_renderer.clear_deck_cache(file_path)
     except Exception:
         pass
-
     print(f"[RAG] Removed file: {file_path} (remaining chunks: {len(_slide_texts)})")
     return True
-
 
 def retrieve_relevant_slides(question, top_k=3):
     """
@@ -700,11 +646,9 @@ def retrieve_relevant_slides(question, top_k=3):
     """
     if _vectors is None or not _slide_texts or top_k <= 0:
         return []
-
     clean_q = normalize_text(question)
     if not clean_q:
         return []
-
     # Filter candidate indices to only those slides covered so far (if lecture tracking is active)
     valid_indices = [
         i for i, c in enumerate(_slide_texts)
@@ -712,26 +656,20 @@ def retrieve_relevant_slides(question, top_k=3):
     ]
     if not valid_indices:
         return []
-
     model = _get_model()
     question_vector = model.encode([clean_q], show_progress_bar=False)[0]
-
     q_mag = np.linalg.norm(question_vector)
     if q_mag < 1e-9:
         return []
     q_norm = question_vector / (q_mag + 1e-9)
-
     candidate_vectors = _vectors[valid_indices]
     v_mags = np.linalg.norm(candidate_vectors, axis=1, keepdims=True)
     v_mags[v_mags < 1e-9] = 1e-9  # Avoid division by zero
     v_norm = candidate_vectors / v_mags
-
     similarities = np.dot(v_norm, q_norm)
     similarities = np.nan_to_num(similarities, nan=-1.0)
-
     effective_k = min(top_k, len(valid_indices))
     top_sub_indices = np.argsort(similarities)[::-1][:effective_k]
-
     results = []
     for sub_idx in top_sub_indices:
         orig_idx = valid_indices[sub_idx]
@@ -744,21 +682,16 @@ def retrieve_relevant_slides(question, top_k=3):
         })
     return results
 
-
 def _is_followup(question):
     q = question.lower().strip()
-
     if any(phrase in q for phrase in _FOLLOWUP_PHRASES):
         return True
-
     word_count = len(q.split())
     if word_count <= 3 and _conversation_history:
         quick_check = retrieve_relevant_slides(question, top_k=1)
         if quick_check and quick_check[0]["score"] < 0.35:
             return True
-
     return False
-
 
 def _build_lecture_text(chunks):
     """
@@ -770,7 +703,6 @@ def _build_lecture_text(chunks):
         f"[{c['source_file']}, slide {c['slide_number']}]: {c['text']}"
         for c in chunks
     )
-
 
 def get_context_for_query(question, top_k=3):
     """
@@ -796,7 +728,6 @@ def get_context_for_query(question, top_k=3):
                     "previous_answer": None,
                     "lecture_text": f"Slide {requested_slide} has not been covered yet in today's lecture.",
                 }
-
             # If multiple files loaded, check if question mentions a specific file name;
             # otherwise prioritize the most recently loaded deck
             chosen = matching_chunks[-1]
@@ -808,7 +739,6 @@ def get_context_for_query(question, top_k=3):
                 if src in q_lower or any(t in q_lower for t in tokens):
                     chosen = c
                     break
-
             print(f"[RAG] Explicit slide reference detected -> slide {requested_slide} ({chosen.get('source_file')}) (exact match, no semantic search)")
             chunks = [{
                 "slide_number": chosen["slide_number"],
@@ -829,7 +759,6 @@ def get_context_for_query(question, top_k=3):
         else:
             print(f"[RAG] Slide {requested_slide} was requested but doesn't exist in loaded lecture(s) "
                   f"({len(_slide_texts)} slides loaded) — falling back to semantic search.")
-
     if _is_followup(question) and _conversation_history:
         last = _conversation_history[-1]
         return {
@@ -841,7 +770,6 @@ def get_context_for_query(question, top_k=3):
             "previous_answer": last["answer"],
             "lecture_text": _build_lecture_text(last["chunks"]),
         }
-
     chunks = retrieve_relevant_slides(question, top_k=top_k)
     return {
         "is_followup": False,
@@ -853,12 +781,10 @@ def get_context_for_query(question, top_k=3):
         "lecture_text": _build_lecture_text(chunks),
     }
 
-
 # Alias — the integration handoff doc refers to this function as
 # retrieve_context(); both names now work so either the orchestrator
 # or this module can use its preferred name without breaking the other.
 retrieve_context = get_context_for_query
-
 
 def add_to_history(question, answer, chunks):
     """
@@ -870,7 +796,6 @@ def add_to_history(question, answer, chunks):
         "answer": answer,
         "chunks": chunks,
     })
-
 
 def clear_lecture():
     """Public interface: wipes ALL currently loaded lecture files AND conversation history."""
@@ -888,15 +813,12 @@ def clear_lecture():
         pass
     print("[RAG] Lecture(s) and conversation history cleared from memory.")
 
-
 def has_lecture_loaded():
     return _vectors is not None
-
 
 def get_loaded_files():
     """Public interface: returns list of currently loaded file paths."""
     return list(_loaded_files)
-
 
 def get_ordered_chunks():
     """
@@ -906,7 +828,6 @@ def get_ordered_chunks():
     returns only the top-k matches for a specific question).
     """
     return list(_slide_texts)
-
 
 def set_lecture_progress(current_slide, max_slide=None):
     """
@@ -921,18 +842,15 @@ def set_lecture_progress(current_slide, max_slide=None):
     else:
         _max_slide_reached = max(_max_slide_reached, current_slide)
 
-
 def get_lecture_progress():
     """Public interface: returns (current_lecture_slide, max_slide_reached)."""
     return _current_lecture_slide, _max_slide_reached
-
 
 def set_max_slide_reached(max_slide):
     """Public interface: sets max_slide_reached directly."""
     global _max_slide_reached
     _max_slide_reached = max_slide
 
-
 def get_max_slide_reached():
     """Public interface: gets max_slide_reached."""
-    return _max_slide_reached
+    return _max_slide_reached
