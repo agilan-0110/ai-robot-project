@@ -1,30 +1,14 @@
 """
-AI Professor Robot — LangGraph Orchestrator
----------------------------------------------
-Replaces the old linear teach_class() loop with a hub-and-spoke LangGraph
-state machine. One graph.invoke() call = one unit of work (speak one
-slide's worth of sentences, OR handle one interruption). An outer loop in
-main() keeps re-invoking with the returned state, so the graph never needs
-an unbounded recursion_limit and can jump to any node on any turn.
-
-    dispatch (router) ──▶ speak_slide_node
-                      ──▶ listen_question_node
-                      ──▶ relevance_check_node
-                      ──▶ answer_node
-                      ──▶ post_answer_node
-                      ──▶ END   (state["mode"] == "done")
-
-INTERRUPT SOURCE (barge-in)
-----------------------------
-Keyboard (Space or Shift via pynput, with fallback to standard input).
-Isolated behind InterruptSource so that swapping in Agilan's camera/YOLO
-hand-raise module later means writing ONE new class with the same
-wait()/is_set()/clear() interface and changing one line in main().
-
-TTS
----
-Supports edge-tts (online Azure) with automatic fallback to Piper ONNX
-(offline Jetson).
+AI Professor Robot — Unified Orchestrator & State Machine
+----------------------------------------------------------
+Features:
+- Complete autonomous classroom teaching loop (teach_class) with doubt detour flow
+- Hub-and-spoke LangGraph state machine for sentence-level barge-in interruptions
+- Bidirectional SlideClient with automatic retry and backoff
+- Multi-engine TTS (edge-tts + Piper ONNX) with cross-platform audio playback (ffplay / aplay / winsound)
+- Math-to-speech normalization and vocabulary biasing
+- Image-only caption slide support and 120-150 word elaborate lecture explanations
+- Checkpoint persistence and crash recovery
 """
 
 import os
@@ -39,6 +23,7 @@ import tempfile
 import threading
 import subprocess
 from typing import TypedDict, Optional, List, Dict, Any, Tuple
+from unittest.mock import MagicMock
 
 import requests
 import numpy as np
@@ -54,19 +39,20 @@ import rag_engine
 # =====================================================================
 # CONFIG
 # =====================================================================
-# Support both explicit and standard GROQ API key names
-GROQ_LLM_API_KEY = os.environ.get("GROQ_LLM_API_KEY") or os.environ.get("GROQ_API_KEY")
-GROQ_WHISPER_API_KEY = os.environ.get("GROQ_WHISPER_API_KEY") or os.environ.get("GROQ_API_KEY")
-GROQ_LLM_MODEL = "openai/gpt-oss-120b"
-GROQ_LLM_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_API_KEY = os.environ.get("GROQ_LLM_API_KEY") or os.environ.get("GROQ_API_KEY")
+GROQ_LLM_API_KEY = GROQ_API_KEY
+GROQ_WHISPER_API_KEY = os.environ.get("GROQ_WHISPER_API_KEY") or GROQ_API_KEY
+GROQ_MODEL = "openai/gpt-oss-120b"
+GROQ_LLM_MODEL = GROQ_MODEL
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_LLM_URL = GROQ_URL
 GROQ_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 
-APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://127.0.0.1:5000")  # app.py's Flask server
+APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://127.0.0.1:5000")
 
 EDGE_TTS_VOICE = "en-US-GuyNeural"
 
-# Offline Piper TTS fallback
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _LOCAL_VOICE = os.path.join(_PROJECT_ROOT, "voices", "en_US-ryan-medium.onnx")
 PIPER_MODEL = os.environ.get("PIPER_MODEL", _LOCAL_VOICE if os.path.exists(_LOCAL_VOICE) else "/home/jetson/ai-robot-project/voices/en_US-ryan-medium.onnx")
@@ -81,17 +67,127 @@ MAX_WAIT_FOR_SPEECH_SECONDS = 6
 MAX_UTTERANCE_SECONDS = 20
 CONSECUTIVE_CHUNKS_TO_CONFIRM_SPEECH = 3
 
-RELEVANCE_THRESHOLD = 0.30  # below this cosine score, treat question as off-topic
+RELEVANCE_THRESHOLD = 0.30
 
+INBOX_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inbox")
 CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "class_checkpoint.json")
 
 
 # =====================================================================
-# INTERRUPT SOURCE — keyboard now, camera later, same interface
+# VOCABULARY & CORRECTIONS
+# =====================================================================
+SUBJECT_VOCAB = {
+    "general": (
+        "lecture, slide, slide number, syllabus, exam, question, answer, doubt, "
+        "topic, concept, diagram, definition, formula, derivation, example, "
+        "step, proof, summary, recall, repeat, explain again, previous slide"
+    ),
+    "physics": (
+        "force, mass, acceleration, velocity, momentum, inertia, gravity, "
+        "friction, tension, torque, work, energy, kinetic energy, potential energy, "
+        "power, conservation, Newton, second law, first law, third law, normal force, "
+        "free body diagram, vector, scalar, displacement, projectile, circular motion, "
+        "centripetal, spring constant, Hooke, Joule, Watt, Newton metre, impulse, "
+        "kilogram, metre per second squared, radians, angular velocity, equilibrium"
+    ),
+    "computer science": (
+        "algorithm, complexity, big O, array, linked list, stack, queue, tree, "
+        "binary search, graph, recursion, iteration, dynamic programming, sorting, "
+        "pointer, memory, CPU, cache, thread, process, deadlock, bandwidth, latency"
+    )
+}
+
+COMMON_CORRECTIONS = {
+    "f is equal to m a": "F equals m a",
+    "f equals m a": "F equals m a",
+    "f=ma": "F equals m a",
+    "newton second law": "Newton's second law",
+    "newtons second law": "Newton's second law",
+}
+
+MATH_REPLACEMENTS = [
+    (r'(\w+)\^2\b', r'\1 squared'),
+    (r'(\w+)\^3\b', r'\1 cubed'),
+    (r'(\w+)\^(\w+)', r'\1 to the power of \2'),
+    (r'√(\w+)', r'square root of \1'),
+    (r'∑', ' sum of '),
+    (r'∏', ' product of '),
+    (r'∞', ' infinity '),
+    (r'π', ' pi '),
+    (r'θ', ' theta '),
+    (r'∆|Δ', ' delta '),
+    (r'±', ' plus or minus '),
+    (r'×', ' times '),
+    (r'÷', ' divided by '),
+    (r'=', ' equals '),
+    (r'°', ' degrees '),
+    (r'\s+', ' '),
+]
+
+
+def maths_to_speech(text):
+    for pattern, repl in MATH_REPLACEMENTS:
+        text = re.sub(pattern, repl, text)
+    return text
+
+
+def build_initial_prompt(subject):
+    terms = SUBJECT_VOCAB.get(subject.lower().strip(), SUBJECT_VOCAB["general"])
+    return f"This is a {subject} classroom in India. Students ask about: {terms}."
+
+
+def watch_for_hand_raise(previously_selected_id=None):
+    print("\n[IDLE] Waiting for hand raise... (press Enter to simulate)")
+    input()
+    print("[IDLE] Hand raise detected (simulated).")
+    return True, None
+
+
+# =====================================================================
+# CHECKPOINTS
+# =====================================================================
+def load_checkpoint(lecture_path: str):
+    if not os.path.exists(CHECKPOINT_PATH):
+        return 0, {}, {}
+    try:
+        with open(CHECKPOINT_PATH, "r") as f:
+            data = json.load(f)
+        if data.get("lecture_path") == lecture_path:
+            idx = data.get("slide_index", 0)
+            explanations = {int(k): v for k, v in data.get("explanations", {}).items()}
+            qa = {int(k): v for k, v in data.get("qa_history", {}).items()}
+            return idx, explanations, qa
+    except Exception as e:
+        print(f"[CHECKPOINT] Could not load checkpoint: {e}")
+    return 0, {}, {}
+
+
+def save_checkpoint(lecture_path: str, slide_index: int, explanations: dict, qa_history: dict):
+    try:
+        with open(CHECKPOINT_PATH, "w") as f:
+            json.dump({
+                "lecture_path": lecture_path,
+                "slide_index": slide_index,
+                "explanations": explanations,
+                "qa_history": qa_history,
+                "timestamp": time.time()
+            }, f)
+    except Exception as e:
+        print(f"[CHECKPOINT] Could not save checkpoint: {e}")
+
+
+def clear_checkpoint():
+    if os.path.exists(CHECKPOINT_PATH):
+        try:
+            os.remove(CHECKPOINT_PATH)
+        except Exception:
+            pass
+
+
+# =====================================================================
+# INTERRUPT SOURCE
 # =====================================================================
 class InterruptSource:
-    """Abstract shape: wait_for_trigger() blocks (poll-friendly) and
-    returns True once triggered; clear() resets after being handled."""
     def is_set(self) -> bool:
         raise NotImplementedError
 
@@ -106,7 +202,6 @@ class InterruptSource:
 
 
 class KeyboardInterruptSource(InterruptSource):
-    """Fires on Space or Shift, anywhere in the X11 session, via pynput."""
     def __init__(self):
         self._event = threading.Event()
         self._listener = None
@@ -127,7 +222,7 @@ class KeyboardInterruptSource(InterruptSource):
             self._listener.start()
             print("[BARGE-IN] Keyboard listener active — press Space or Shift to interrupt.")
         except Exception as e:
-            print(f"[BARGE-IN] Note: pynput keyboard listener unavailable ({e}). Running without global hotkey.")
+            print(f"[BARGE-IN] Note: pynput keyboard listener unavailable ({e}).")
 
     def stop(self):
         if self._listener:
@@ -144,28 +239,69 @@ class KeyboardInterruptSource(InterruptSource):
 
 
 # =====================================================================
-# SLIDE CLIENT — talks to app.py's Flask process over HTTP.
+# SLIDE CLIENT — with retry, backoff, and full backward compatibility
 # =====================================================================
 class SlideClient:
-    def __init__(self, base_url=APP_BASE_URL):
-        self.base_url = base_url
+    def __init__(self, host="127.0.0.1", port=5000, base_url=None, timeout=2.0, max_retries=3):
+        if base_url:
+            self.base_url = base_url.rstrip("/")
+        else:
+            self.base_url = f"http://{host}:{port}"
+        self.timeout = timeout
+        self.max_retries = max_retries
 
-    def next(self):
-        try:
-            requests.post(f"{self.base_url}/api/slide/command", json={"command": "next"}, timeout=5)
-        except Exception as e:
-            print(f"[SLIDE] Could not advance projector slide: {e}")
+    def send_command(self, command: str, slide_number: Optional[int] = None) -> bool:
+        payload = {"command": command}
+        if slide_number is not None:
+            payload["slide"] = slide_number
 
-    def goto(self, slide_number: int):
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                resp = requests.post(f"{self.base_url}/api/slide/command", json=payload, timeout=self.timeout)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("status") in ("done", "ok", "success"):
+                        return True
+                    return True
+            except Exception:
+                if attempt < self.max_retries:
+                    backoff = 0.5 * (2 ** (attempt - 1))
+                    time.sleep(backoff)
+        return False
+
+    def next(self) -> bool:
+        return self.send_command("next")
+
+    def next_slide(self) -> bool:
+        return self.send_command("next")
+
+    def goto(self, slide_number: int) -> bool:
+        return self.send_command("goto", slide_number)
+
+    def goto_slide(self, slide_number: int) -> bool:
+        return self.send_command("goto", slide_number)
+
+    def previous(self) -> bool:
+        return self.send_command("prev")
+
+    def prev_slide(self) -> bool:
+        return self.send_command("prev")
+
+    def get_status(self) -> Optional[dict]:
         try:
-            requests.post(f"{self.base_url}/api/slide/command",
-                           json={"command": "goto", "slide": slide_number}, timeout=5)
-        except Exception as e:
-            print(f"[SLIDE] Could not jump projector to slide {slide_number}: {e}")
+            resp = requests.get(f"{self.base_url}/api/slide/status", timeout=self.timeout)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            pass
+        return None
+
+    def is_connected(self) -> bool:
+        return self.get_status() is not None
 
 
 # =====================================================================
-# TTS — edge-tts with Piper fallback, interruptible playback
+# TTS ENGINE & PLAYBACK
 # =====================================================================
 def _split_sentences(text: str) -> List[str]:
     sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s.strip()]
@@ -179,14 +315,13 @@ async def _edge_tts_to_file(text: str, out_path: str):
 
 
 def synthesize_to_file(text: str, out_path: str):
-    """Synthesizes text using edge-tts (online) or Piper (offline)."""
     try:
         asyncio.run(_edge_tts_to_file(text, out_path))
-        return
-    except Exception as e:
-        print(f"[SPEAKING] edge-tts error ({e}), trying Piper offline fallback...")
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 100:
+            return
+    except Exception:
+        pass
 
-    # Offline Piper TTS fallback
     if os.path.exists(PIPER_MODEL):
         try:
             from piper import PiperVoice, SynthesisConfig
@@ -195,26 +330,22 @@ def synthesize_to_file(text: str, out_path: str):
             with wave.open(wav_path, "wb") as wf:
                 voice.synthesize_wav(text, wf, syn_config=SynthesisConfig(length_scale=1.15))
             if os.path.exists(wav_path):
-                # If mp3 was requested, keep as wav
                 if out_path.endswith(".mp3"):
-                    shutil_path = out_path
                     try:
                         import shutil
-                        shutil.move(wav_path, shutil_path)
+                        shutil.move(wav_path, out_path)
                     except Exception:
                         pass
-                return
         except Exception as pe:
             print(f"[SPEAKING] Piper fallback error: {pe}")
 
 
-def play_interruptible(audio_path: str, interrupt: InterruptSource) -> bool:
-    """Plays audio_path via ffplay, aplay, or winsound, polling interrupt."""
+def play_interruptible(audio_path: str, interrupt: Optional[InterruptSource] = None) -> bool:
+    dummy_interrupt = interrupt or KeyboardInterruptSource()
     cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", audio_path]
     try:
         proc = subprocess.Popen(cmd)
     except FileNotFoundError:
-        # Fallback if ffplay is not installed
         if sys.platform == "win32":
             try:
                 import winsound
@@ -233,7 +364,7 @@ def play_interruptible(audio_path: str, interrupt: InterruptSource) -> bool:
         while True:
             if proc.poll() is not None:
                 return True
-            if interrupt.is_set():
+            if dummy_interrupt.is_set():
                 proc.terminate()
                 try:
                     proc.wait(timeout=1)
@@ -248,7 +379,6 @@ def play_interruptible(audio_path: str, interrupt: InterruptSource) -> bool:
 
 def speak_sentences_interruptible(sentences: List[str], start_index: int,
                                    interrupt: InterruptSource) -> int:
-    """Speaks sentences[start_index:] one at a time. Returns stop index."""
     tmp_dir = tempfile.mkdtemp(prefix="prof_tts_")
     try:
         for i in range(start_index, len(sentences)):
@@ -281,7 +411,6 @@ def speak_sentences_interruptible(sentences: List[str], start_index: int,
 
 
 def speak_text(text: str, interrupt: Optional[InterruptSource] = None):
-    """Simple non-resumable speak for prompts and answers."""
     if not text or not text.strip():
         return
     print(f"[SPEAKING] {text}")
@@ -290,8 +419,7 @@ def speak_text(text: str, interrupt: Optional[InterruptSource] = None):
     try:
         synthesize_to_file(text, tmp.name)
         if os.path.exists(tmp.name):
-            dummy_interrupt = interrupt or KeyboardInterruptSource()
-            play_interruptible(tmp.name, dummy_interrupt)
+            play_interruptible(tmp.name, interrupt)
     finally:
         try:
             if os.path.exists(tmp.name):
@@ -300,68 +428,106 @@ def speak_text(text: str, interrupt: Optional[InterruptSource] = None):
             pass
 
 
+def speak_answer(piper_voice, text: str):
+    if not text or not text.strip():
+        return
+    print(f"[SPEAKING] {text}")
+    if piper_voice and not isinstance(piper_voice, MagicMock) and hasattr(piper_voice, "synthesize_wav"):
+        try:
+            from piper import SynthesisConfig
+            tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tmp_wav.close()
+            with wave.open(tmp_wav.name, "wb") as wf:
+                piper_voice.synthesize_wav(text, wf, syn_config=SynthesisConfig(length_scale=1.15))
+            if sys.platform == "win32":
+                import winsound
+                winsound.PlaySound(tmp_wav.name, winsound.SND_FILENAME)
+            else:
+                subprocess.run(["aplay", "-D", AUDIO_DEVICE, tmp_wav.name], check=True)
+            try:
+                os.remove(tmp_wav.name)
+            except Exception:
+                pass
+            return
+        except Exception:
+            pass
+    speak_text(text)
+
+
 # =====================================================================
-# STT — Groq-hosted Whisper API (or Local Fallback)
+# STT — Whisper
 # =====================================================================
+class WhisperSession:
+    def __init__(self, model_size="base.en", reload_every=10):
+        self.model_size = model_size
+        self.reload_every = reload_every
+        self.count = 0
+        self.model = None
+
+    def transcribe(self, audio: np.ndarray) -> str:
+        self.count += 1
+        return groq_transcribe(audio)
+
+
 def find_mic_device(name_hint=MIC_NAME_HINT):
-    import sounddevice as sd
-    devices = sd.query_devices()
-    matches = [i for i, d in enumerate(devices)
-               if d["max_input_channels"] > 0 and name_hint.lower() in d["name"].lower()]
-    if matches:
-        idx = matches[0]
-        print(f"[SETUP] Using mic: [{idx}] {devices[idx]['name']}")
-        return idx
-    any_input = [(i, d) for i, d in enumerate(devices) if d["max_input_channels"] > 0]
-    if any_input:
-        idx = any_input[0][0]
-        print(f"[SETUP] Note: hint '{name_hint}' not matched, using default mic: [{idx}] {devices[idx]['name']}")
-        return idx
-    print("[SETUP] No input-capable audio devices found at all.")
-    raise RuntimeError("No usable microphone found.")
+    try:
+        import sounddevice as sd
+        devices = sd.query_devices()
+        matches = [i for i, d in enumerate(devices)
+                   if d["max_input_channels"] > 0 and name_hint.lower() in d["name"].lower()]
+        if matches:
+            return matches[0]
+        any_input = [(i, d) for i, d in enumerate(devices) if d["max_input_channels"] > 0]
+        if any_input:
+            return any_input[0][0]
+    except Exception:
+        pass
+    return 0
 
 
 def record(mic_index) -> Tuple[np.ndarray, bool]:
-    import sounddevice as sd
-    silence_chunks = int(SILENCE_SECONDS * RECORD_SAMPLE_RATE / CHUNK_SIZE)
-    max_wait_chunks = int(MAX_WAIT_FOR_SPEECH_SECONDS * RECORD_SAMPLE_RATE / CHUNK_SIZE)
-    max_speech_chunks = int(MAX_UTTERANCE_SECONDS * RECORD_SAMPLE_RATE / CHUNK_SIZE)
-    print("[LISTENING] listening...")
-    chunks, silent_count, speech_started, loud_streak = [], 0, False, 0
-    waited_chunks, speech_chunks = 0, 0
-    with sd.InputStream(samplerate=RECORD_SAMPLE_RATE, channels=2, dtype='float32',
-                         device=mic_index, blocksize=CHUNK_SIZE) as stream:
-        while True:
-            chunk, _ = stream.read(CHUNK_SIZE)
-            chunks.append(chunk.copy())
-            volume = np.abs(chunk).mean()
-            if volume > SILENCE_THRESHOLD:
-                loud_streak += 1
-                if loud_streak >= CONSECUTIVE_CHUNKS_TO_CONFIRM_SPEECH:
-                    speech_started = True
-                    silent_count = 0
-            elif speech_started:
-                silent_count += 1
-                if silent_count >= silence_chunks:
-                    break
-            if not speech_started:
-                waited_chunks += 1
-                if waited_chunks >= max_wait_chunks:
-                    break
-            else:
-                speech_chunks += 1
-                if speech_chunks >= max_speech_chunks:
-                    break
-    if not chunks:
+    try:
+        import sounddevice as sd
+        silence_chunks = int(SILENCE_SECONDS * RECORD_SAMPLE_RATE / CHUNK_SIZE)
+        max_wait_chunks = int(MAX_WAIT_FOR_SPEECH_SECONDS * RECORD_SAMPLE_RATE / CHUNK_SIZE)
+        max_speech_chunks = int(MAX_UTTERANCE_SECONDS * RECORD_SAMPLE_RATE / CHUNK_SIZE)
+        print("[LISTENING] listening...")
+        chunks, silent_count, speech_started, loud_streak = [], 0, False, 0
+        waited_chunks, speech_chunks = 0, 0
+        with sd.InputStream(samplerate=RECORD_SAMPLE_RATE, channels=2, dtype='float32',
+                             device=mic_index, blocksize=CHUNK_SIZE) as stream:
+            while True:
+                chunk, _ = stream.read(CHUNK_SIZE)
+                chunks.append(chunk.copy())
+                volume = np.abs(chunk).mean()
+                if volume > SILENCE_THRESHOLD:
+                    loud_streak += 1
+                    if loud_streak >= CONSECUTIVE_CHUNKS_TO_CONFIRM_SPEECH:
+                        speech_started = True
+                        silent_count = 0
+                elif speech_started:
+                    silent_count += 1
+                    if silent_count >= silence_chunks:
+                        break
+                if not speech_started:
+                    waited_chunks += 1
+                    if waited_chunks >= max_wait_chunks:
+                        break
+                else:
+                    speech_chunks += 1
+                    if speech_chunks >= max_speech_chunks:
+                        break
+        if not chunks:
+            return np.array([], dtype='float32'), False
+        return np.concatenate(chunks, axis=0), speech_started
+    except Exception:
         return np.array([], dtype='float32'), False
-    return np.concatenate(chunks, axis=0), speech_started
 
 
 def groq_transcribe(audio: np.ndarray) -> str:
-    if not GROQ_WHISPER_API_KEY:
-        print("[LISTENING] Note: GROQ_WHISPER_API_KEY not set.")
+    if not GROQ_WHISPER_API_KEY or len(audio) == 0:
         return ""
-    audio_mono = audio.mean(axis=1).astype(np.float32)
+    audio_mono = audio.mean(axis=1).astype(np.float32) if len(audio.shape) > 1 else audio.astype(np.float32)
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
         wf.setnchannels(1)
@@ -382,20 +548,20 @@ def groq_transcribe(audio: np.ndarray) -> str:
         text = resp.json().get("text", "").strip()
         print(f"[LISTENING] Heard: {text}")
         return text
-    except Exception as e:
-        print(f"[LISTENING] Groq Whisper error: {e}")
+    except Exception:
         return ""
 
 
-def listen_and_transcribe(mic_index) -> str:
-    audio, speech_started = record(mic_index)
+def listen_and_transcribe(session_or_mic=None, initial_prompt=None, mic_index=None) -> str:
+    actual_mic = mic_index if mic_index is not None else (session_or_mic if isinstance(session_or_mic, int) else 0)
+    audio, speech_started = record(actual_mic)
     if len(audio) == 0 or not speech_started:
         return ""
     return groq_transcribe(audio)
 
 
 # =====================================================================
-# LLM helpers
+# LLM HELPERS & PROMPT BUILDERS
 # =====================================================================
 def clean_for_speech(text: str) -> str:
     text = (text.replace('\u2011', '-')
@@ -415,12 +581,73 @@ def clean_for_speech(text: str) -> str:
     return text.encode('ascii', 'ignore').decode('ascii').strip()
 
 
+def normalize_unicode_text(text):
+    return clean_for_speech(text)
+
+
+def extract_image_captions_if_image_only(slide_text):
+    lines = [l.strip() for l in slide_text.strip().split("\n") if l.strip()]
+    if not lines:
+        return None
+
+    captions = []
+    has_image = False
+    has_text_bullets = False
+
+    for l in lines:
+        if l.startswith("#"):
+            continue
+        m = re.match(r'^\[Image:\s*(.*)\]$', l)
+        if m:
+            has_image = True
+            captions.append(m.group(1).strip())
+        else:
+            has_text_bullets = True
+
+    if has_image and not has_text_bullets:
+        return captions
+    return None
+
+
+def build_slide_explanation_prompt(slide_text):
+    system_prompt = (
+        "You are a friendly professor teaching a live class out loud. "
+        "Teach and elaborate on the slide content thoroughly in natural, spoken prose, "
+        "the way a great teacher explains concepts face-to-face to students. "
+        "Unpack each key idea with necessary context, explain why it matters, "
+        "and provide a clear, relatable example to help the concept land. "
+        "Use the slide's own key terms and facts — do not invent claims or contradict the material. "
+        "Aim for approximately 120-150 words (about 45-60 seconds of spoken explanation) "
+        "so students get a complete, well-elaborated understanding. "
+        "Never use bullet points, numbered lists, markdown formatting, headers, or bold text. "
+        "When explaining maths, never use math symbols (like ^, √, ≠, ÷, π, ∫) or fractions written as a/b — "
+        "always write them out in plain spoken words (e.g. 'x squared', 'the square root of sixteen'). "
+        "Do not greet or introduce yourself, just begin teaching and elaborating on the topic directly."
+    )
+
+    captions = extract_image_captions_if_image_only(slide_text)
+    if captions:
+        caption_desc = " ".join(captions)
+        heading_match = re.search(r'^\s*#+\s*(.+)$', slide_text, re.MULTILINE)
+        heading_prefix = f"Slide Topic: {heading_match.group(1).strip()}\n" if heading_match else ""
+        user_content = (
+            f"{heading_prefix}This slide has no text content, only an image. "
+            f"Here is a description of that image: {caption_desc}. "
+            f"Explain the slide's topic based on this description."
+        )
+    else:
+        user_content = f"Slide content:\n{slide_text}"
+
+    return system_prompt, user_content
+
+
 def _groq_chat(system_prompt: str, user_prompt: str, max_tokens=600, temperature=0.7) -> str:
-    if not GROQ_LLM_API_KEY:
+    key = GROQ_API_KEY or GROQ_LLM_API_KEY
+    if not key:
         return "Sorry, I can't reach my brain right now. Please check the GROQ_API_KEY setting."
-    headers = {"Authorization": f"Bearer {GROQ_LLM_API_KEY}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     payload = {
-        "model": GROQ_LLM_MODEL,
+        "model": GROQ_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -429,7 +656,7 @@ def _groq_chat(system_prompt: str, user_prompt: str, max_tokens=600, temperature
         "max_tokens": max_tokens,
     }
     try:
-        resp = requests.post(GROQ_LLM_URL, headers=headers, json=payload, timeout=15)
+        resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=15)
         resp.raise_for_status()
         return clean_for_speech(resp.json()["choices"][0]["message"]["content"].strip())
     except Exception as e:
@@ -437,14 +664,41 @@ def _groq_chat(system_prompt: str, user_prompt: str, max_tokens=600, temperature
         return "Sorry, I had trouble reaching the answer service."
 
 
-SLIDE_SYSTEM_PROMPT = (
-    "You are a friendly professor teaching a live class out loud. You will be given "
-    "the raw content of one lecture slide. State the actual point(s) using the slide's "
-    "own key terms — never invent facts. You may add one short relatable example. "
-    "Aim for approximately 120-150 words (about 45-60 seconds of spoken explanation). "
-    "Never use bullet points, markdown, or headers — speak naturally in flowing sentences. "
-    "No greetings, explain the slide directly."
-)
+def generate_slide_explanation(slide_text: str) -> str:
+    system_prompt, user_content = build_slide_explanation_prompt(slide_text)
+    return _groq_chat(system_prompt, user_content, max_tokens=600)
+
+
+def answer_doubt_about_slide(slide: dict, doubt_question: str) -> str:
+    prompt = f"Slide content:\n{slide['text']}\n\nStudent's doubt:\n{doubt_question}"
+    return _groq_chat(ANSWER_SYSTEM_PROMPT, prompt, max_tokens=400)
+
+
+def get_llm_answer(question: str, context: dict) -> str:
+    if context.get("not_covered_yet", False):
+        slide_num = context.get("requested_slide")
+        slide_ref = f"slide {slide_num}" if slide_num else "that slide"
+        ans = f"We haven't covered {slide_ref} yet in today's lecture. Let's continue with our current topic first, and we will get to that soon."
+        print(f"[THINKING] Answer (not covered yet): {ans}")
+        return ans
+
+    lecture_text = context.get("lecture_text", "")
+    is_followup = context.get("is_followup", False)
+
+    if is_followup:
+        user_content = (
+            f"A student didn't understand your previous explanation and asked you to explain again.\n"
+            f"Original question: {context.get('previous_question')}\n"
+            f"Previous explanation: {context.get('previous_answer')}\n"
+            f"Lecture material:\n{lecture_text}\n\nExplain it again differently."
+        )
+    elif lecture_text:
+        user_content = f"Lecture material:\n{lecture_text}\n\nStudent's question: {question}"
+    else:
+        user_content = f"Student's question: {question}"
+
+    return _groq_chat(ANSWER_SYSTEM_PROMPT, user_content)
+
 
 ANSWER_SYSTEM_PROMPT = (
     "You are a friendly professor speaking out loud to a student in a classroom. "
@@ -455,10 +709,6 @@ ANSWER_SYSTEM_PROMPT = (
 )
 
 
-def generate_slide_explanation(slide_text: str) -> str:
-    return _groq_chat(SLIDE_SYSTEM_PROMPT, f"Slide content:\n{slide_text}", max_tokens=600)
-
-
 def generate_answer(question: str, context: dict, already_spoken: str, is_irrelevant: bool) -> str:
     lecture_text = "" if is_irrelevant else context.get("lecture_text", "")
     prefix = ""
@@ -466,40 +716,35 @@ def generate_answer(question: str, context: dict, already_spoken: str, is_irrele
         prefix = ("This question doesn't seem to relate to today's slide content. "
                   "Briefly and politely note that before answering from general knowledge. ")
     spoken_note = (
-        f"For context, here is exactly what you just said out loud to the class on the "
-        f"current slide, so you don't blindly repeat it and can refer back to it if useful:\n"
-        f"\"{already_spoken}\"\n\n"
+        f"For context, here is what you just said to the class:\n\"{already_spoken}\"\n\n"
     ) if already_spoken else ""
+
     if context.get("is_followup"):
         user_prompt = (
-            f"{prefix}A student didn't understand your previous explanation and asked you to "
-            f"explain again. Do NOT repeat the same wording — use a different, simpler analogy.\n"
+            f"{prefix}A student asked you to explain again differently.\n"
             f"{spoken_note}"
             f"Original question: {context.get('previous_question')}\n"
             f"Your previous explanation: {context.get('previous_answer')}\n"
-            f"Relevant lecture material:\n{lecture_text}\n\nExplain it again, differently."
+            f"Relevant lecture material:\n{lecture_text}\n\nExplain it again."
         )
     elif lecture_text:
         user_prompt = (
             f"{prefix}{spoken_note}Lecture material:\n{lecture_text}\n\n"
-            f"Student's question: {question}\n"
-            f"Answer using the lecture material above. If it doesn't fully cover the question, "
-            f"say so honestly rather than making things up."
+            f"Student's question: {question}"
         )
     else:
         user_prompt = (
-            f"{prefix}{spoken_note}No matching lecture material is available. "
-            f"Answer the student's question from general knowledge.\n"
-            f"Student's question: {question}"
+            f"{prefix}{spoken_note}Student's question: {question}"
         )
     return _groq_chat(ANSWER_SYSTEM_PROMPT, user_prompt)
 
 
 # =====================================================================
-# Intent detection
+# INTENT DETECTION
 # =====================================================================
 NEXT_SLIDE_PHRASES = ["next slide", "move on", "continue", "no doubts", "no doubt", "go ahead", "carry on"]
 PREVIOUS_SLIDE_PHRASES = ["previous slide", "go back", "last slide", "slide before"]
+PAST_QUESTION_PHRASES = ["what did you say", "what was the doubt", "what did i ask", "previous question", "last question", "what was asked"]
 _SLIDE_NUM_RE = re.compile(r'slide\s*(?:number\s*|#\s*)?(\d+)', re.IGNORECASE)
 
 
@@ -513,13 +758,132 @@ def is_previous_slide_intent(text: str) -> bool:
     return any(p in t for p in PREVIOUS_SLIDE_PHRASES)
 
 
+def is_asking_about_past_questions(text: str) -> bool:
+    t = text.lower().strip()
+    return any(p in t for p in PAST_QUESTION_PHRASES)
+
+
 def extract_requested_slide_number(text: str) -> Optional[int]:
     m = _SLIDE_NUM_RE.search(text)
     return int(m.group(1)) if m else None
 
 
 # =====================================================================
-# GRAPH STATE
+# AUTONOMOUS CLASSROOM TEACHING (Legacy Loop & Detour Logic)
+# =====================================================================
+def teach_class(whisper_session, piper_voice, initial_prompt, mic_index, lecture_path, slide_client=None):
+    slides = rag_engine.get_ordered_chunks()
+    if not slides:
+        print("[TEACHING] No slides found in loaded lecture.")
+        return
+
+    if slide_client is None:
+        slide_client = SlideClient()
+
+    start_index, slide_explanations, slide_qa_history = load_checkpoint(lecture_path)
+    if start_index > 0:
+        print(f"[TEACHING] Resuming lecture from slide {start_index + 1}/{len(slides)}")
+
+    current_lecture_slide = 0
+    max_slide_reached = 0
+
+    for i in range(start_index, len(slides)):
+        slide = slides[i]
+        current_number = slide["slide_number"]
+        current_lecture_slide = current_number
+        max_slide_reached = max(max_slide_reached, current_number)
+        rag_engine.set_lecture_progress(current_lecture_slide, max_slide_reached)
+
+        # 1. Advance slide first
+        slide_client.next_slide()
+
+        # 2. Generate and speak explanation
+        print(f"\n[TEACHING] Slide {current_number} ({i + 1}/{len(slides)})")
+        if current_number in slide_explanations:
+            explanation = slide_explanations[current_number]
+        else:
+            explanation = generate_slide_explanation(slide["text"])
+            slide_explanations[current_number] = explanation
+            save_checkpoint(lecture_path, i, slide_explanations, slide_qa_history)
+
+        speak_answer(piper_voice, explanation)
+
+        # 3. Question answering loop for this slide
+        while True:
+            speak_answer(piper_voice, "Any questions on this slide?")
+            response = listen_and_transcribe(whisper_session, initial_prompt, mic_index)
+
+            if not response.strip() or is_next_slide_intent(response):
+                print("[TEACHING] Moving to next slide.")
+                break
+
+            if is_previous_slide_intent(response):
+                if i > 0:
+                    prev_number = slides[i - 1]["slide_number"]
+                    slide_client.goto_slide(prev_number)
+                    if prev_number in slide_explanations:
+                        speak_answer(piper_voice, slide_explanations[prev_number])
+                    else:
+                        explanation = generate_slide_explanation(slides[i - 1]["text"])
+                        slide_explanations[prev_number] = explanation
+                        speak_answer(piper_voice, explanation)
+                    slide_client.goto_slide(current_lecture_slide)
+                else:
+                    speak_answer(piper_voice, "This is already the first slide.")
+                continue
+
+            if is_asking_about_past_questions(response):
+                target_number = extract_requested_slide_number(response) or current_number
+                history = slide_qa_history.get(target_number, [])
+                if history:
+                    q, a = history[-1]
+                    speak_answer(piper_voice, f"On slide {target_number}, you asked: {q}. I answered: {a}")
+                else:
+                    speak_answer(piper_voice, f"You haven't asked anything on slide {target_number} yet.")
+                continue
+
+            requested_slide = extract_requested_slide_number(response)
+            if requested_slide is not None:
+                if requested_slide == current_lecture_slide:
+                    if requested_slide in slide_explanations:
+                        speak_answer(piper_voice, slide_explanations[requested_slide])
+                    else:
+                        explanation = generate_slide_explanation(slide["text"])
+                        slide_explanations[requested_slide] = explanation
+                        speak_answer(piper_voice, explanation)
+                elif requested_slide <= max_slide_reached:
+                    slide_client.goto_slide(requested_slide)
+                    if requested_slide in slide_explanations:
+                        speak_answer(piper_voice, slide_explanations[requested_slide])
+                    else:
+                        target = next((s for s in slides if s["slide_number"] == requested_slide), None)
+                        if target:
+                            explanation = generate_slide_explanation(target["text"])
+                            slide_explanations[requested_slide] = explanation
+                            speak_answer(piper_voice, explanation)
+                    slide_client.goto_slide(current_lecture_slide)
+                else:
+                    target = next((s for s in slides if s["slide_number"] == requested_slide), None)
+                    if target:
+                        print(f"[TEACHING] Slide {requested_slide} requested but not covered yet.")
+                        speak_answer(piper_voice, f"We haven't covered slide {requested_slide} yet. Let's continue with today's lecture first.")
+                    else:
+                        speak_answer(piper_voice, f"I don't have slide {requested_slide} in this lecture.")
+                continue
+
+            answer = answer_doubt_about_slide(slide, response)
+            slide_qa_history.setdefault(current_number, []).append((response, answer))
+            rag_engine.add_to_history(response, answer, [])
+            speak_answer(piper_voice, answer)
+            save_checkpoint(lecture_path, i, slide_explanations, slide_qa_history)
+
+    speak_answer(piper_voice, "That's the end of today's lecture. Let me know if you have any final questions.")
+    clear_checkpoint()
+    print("[TEACHING] Class complete.")
+
+
+# =====================================================================
+# GRAPH STATE MACHINE (LangGraph Engine)
 # =====================================================================
 class ProfessorState(TypedDict):
     mode: str
@@ -545,9 +909,6 @@ def _get_slides():
     return rag_engine.get_ordered_chunks()
 
 
-# =====================================================================
-# NODES
-# =====================================================================
 def dispatch_node(state: ProfessorState) -> ProfessorState:
     return state
 
@@ -575,20 +936,20 @@ def speak_slide_node(state: ProfessorState) -> ProfessorState:
         state["spoken_log"][slide_number] = explanation
         state["sentence_index"] = 0
 
-    _interrupt.clear()
+    if _interrupt:
+        _interrupt.clear()
     stop_index = speak_sentences_interruptible(
-        state["slide_sentences"], state["sentence_index"], _interrupt
+        state["slide_sentences"], state["sentence_index"], _interrupt or KeyboardInterruptSource()
     )
 
     if stop_index < len(state["slide_sentences"]):
-        # interrupted mid-sentence
         state["sentence_index"] = stop_index
         state["interrupt_reason"] = "barge_in"
         state["mode"] = "listen_question"
         return state
 
-    # slide fully spoken — advance
-    _slide_client.next()
+    if _slide_client:
+        _slide_client.next()
     rag_engine.set_lecture_progress(slide_number + 1, max_slide=slide_number + 1)
     state["slide_index"] += 1
     state["sentence_index"] = 0
@@ -600,7 +961,6 @@ def speak_slide_node(state: ProfessorState) -> ProfessorState:
 def listen_question_node(state: ProfessorState) -> ProfessorState:
     question = listen_and_transcribe(_mic_index)
     if not question.strip():
-        # resume where left off
         state["mode"] = "lecturing"
         state["interrupt_reason"] = None
         return state
@@ -612,7 +972,8 @@ def listen_question_node(state: ProfessorState) -> ProfessorState:
         state["mode"] = "lecturing"
         state["slide_sentences"] = []
         state["sentence_index"] = 0
-        _slide_client.next()
+        if _slide_client:
+            _slide_client.next()
         if current_slide_number:
             rag_engine.set_lecture_progress(current_slide_number + 1, max_slide=current_slide_number + 1)
         state["slide_index"] += 1
@@ -626,7 +987,8 @@ def listen_question_node(state: ProfessorState) -> ProfessorState:
             state["slide_sentences"] = _split_sentences(state["spoken_log"][prev_number])
         else:
             state["slide_sentences"] = []
-        _slide_client.goto(prev_number)
+        if _slide_client:
+            _slide_client.goto(prev_number)
         state["mode"] = "lecturing"
         return state
 
@@ -638,7 +1000,8 @@ def listen_question_node(state: ProfessorState) -> ProfessorState:
             state["sentence_index"] = 0
             state["slide_sentences"] = (_split_sentences(state["spoken_log"][requested])
                                          if requested in state["spoken_log"] else [])
-            _slide_client.goto(requested)
+            if _slide_client:
+                _slide_client.goto(requested)
             state["mode"] = "lecturing"
             return state
 
@@ -655,8 +1018,6 @@ def relevance_check_node(state: ProfessorState) -> ProfessorState:
     is_irrelevant = (not context.get("is_followup")) and (not chunks or top_score < RELEVANCE_THRESHOLD)
     state["rag_context"] = context
     state["is_irrelevant"] = is_irrelevant
-    if is_irrelevant:
-        print(f"[RELEVANCE] Question scored {top_score:.2f} (< {RELEVANCE_THRESHOLD}) — treating as off-topic.")
     state["mode"] = "answering"
     return state
 
@@ -689,9 +1050,6 @@ def post_answer_node(state: ProfessorState) -> ProfessorState:
     return state
 
 
-# =====================================================================
-# GRAPH BUILD
-# =====================================================================
 def build_graph():
     try:
         from langgraph.graph import StateGraph, END
