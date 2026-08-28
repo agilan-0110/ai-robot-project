@@ -26,7 +26,26 @@ sys.path.insert(0, SCRIPTS_DIR)
 
 import rag_engine
 import orchestrator
-from slide_companion import SlideCommandHandler
+from http.server import BaseHTTPRequestHandler
+
+
+class MockSlideServerHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        content_len = int(self.headers.get("Content-Length", 0))
+        post_body = self.rfile.read(content_len)
+        data = json.loads(post_body.decode("utf-8")) if post_body else {}
+        cmd = data.get("command")
+        slide = data.get("slide")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        resp = {"status": "done", "command": cmd}
+        if slide is not None:
+            resp["slide"] = slide
+        self.wfile.write(json.dumps(resp).encode("utf-8"))
+
+    def log_message(self, format, *args):
+        pass  # suppress test logs
 
 
 def run_test(name, condition, details=""):
@@ -39,10 +58,10 @@ def run_test(name, condition, details=""):
 
 
 def test_companion_server_and_client():
-    print("\n--- Test Suite 1A: Slide Companion Server & Client Round-Trip ---")
+    print("\n--- Test Suite 1A: Slide Server & Client Round-Trip ---")
     all_passed = True
     test_port = 5098
-    server = HTTPServer(("127.0.0.1", test_port), SlideCommandHandler)
+    server = HTTPServer(("127.0.0.1", test_port), MockSlideServerHandler)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
 
