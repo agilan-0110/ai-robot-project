@@ -12,193 +12,14 @@ os.makedirs(INBOX_FOLDER, exist_ok=True)
 
 ALLOWED_EXTENSIONS = {".pptx", ".pdf", ".docx"}
 
-UPLOAD_PAGE = """
+UNIFIED_PAGE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Professor Robot - Dashboard & Upload</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: 'Inter', sans-serif;
-            background: #0f172a;
-            color: #f8fafc;
-            min-height: 100vh;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            padding: 20px;
-        }
-        .card {
-            background: #1e293b;
-            border: 1px solid #334155;
-            border-radius: 16px;
-            padding: 36px;
-            width: 100%;
-            max-width: 560px;
-            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
-        }
-        h1 {
-            font-size: 1.6rem;
-            font-weight: 700;
-            background: linear-gradient(135deg, #38bdf8, #818cf8);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            margin-bottom: 8px;
-        }
-        p.subtitle { color: #94a3b8; font-size: 0.9rem; margin-bottom: 24px; }
-        .btn-live {
-            display: block;
-            text-align: center;
-            background: linear-gradient(135deg, #2563eb, #7c3aed);
-            color: white;
-            padding: 14px 20px;
-            border-radius: 10px;
-            text-decoration: none;
-            font-weight: 600;
-            font-size: 1rem;
-            margin-bottom: 28px;
-            box-shadow: 0 4px 14px 0 rgba(124, 58, 237, 0.39);
-            transition: transform 0.15s ease, box-shadow 0.15s ease;
-        }
-        .btn-live:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 20px 0 rgba(124, 58, 237, 0.5);
-        }
-        .upload-section {
-            border-top: 1px solid #334155;
-            padding-top: 24px;
-            margin-top: 8px;
-        }
-        .file-input-wrapper {
-            position: relative;
-            margin-bottom: 16px;
-        }
-        input[type="file"] {
-            width: 100%;
-            padding: 12px;
-            background: #0f172a;
-            border: 1px dashed #475569;
-            border-radius: 8px;
-            color: #cbd5e1;
-            font-size: 0.9rem;
-            cursor: pointer;
-        }
-        button.btn-submit {
-            width: 100%;
-            background: #0284c7;
-            color: white;
-            border: none;
-            padding: 12px;
-            border-radius: 8px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: background 0.15s ease;
-        }
-        button.btn-submit:hover { background: #0369a1; }
-        .msg {
-            margin-top: 16px;
-            padding: 12px;
-            border-radius: 8px;
-            background: rgba(14, 165, 233, 0.15);
-            border: 1px solid rgba(14, 165, 233, 0.3);
-            color: #38bdf8;
-            font-size: 0.9rem;
-        }
-        .files-list {
-            margin-top: 24px;
-            border-top: 1px solid #334155;
-            padding-top: 20px;
-        }
-        .files-list h3 { font-size: 1rem; color: #cbd5e1; margin-bottom: 12px; }
-        .file-item {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            background: #0f172a;
-            padding: 10px 14px;
-            border-radius: 8px;
-            margin-bottom: 8px;
-            font-size: 0.88rem;
-            color: #e2e8f0;
-        }
-        .btn-remove {
-            background: #ef4444;
-            color: white;
-            border: none;
-            padding: 4px 10px;
-            border-radius: 6px;
-            font-size: 0.75rem;
-            font-weight: 600;
-            cursor: pointer;
-        }
-        .btn-clear-all {
-            width: 100%;
-            background: #dc2626;
-            color: white;
-            border: none;
-            padding: 10px;
-            border-radius: 8px;
-            font-weight: 600;
-            font-size: 0.85rem;
-            margin-top: 12px;
-            cursor: pointer;
-        }
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h1>AI Professor Robot</h1>
-        <p class="subtitle">Autonomous Classroom Teaching & Live Presentation</p>
-
-        <a href="/presentation" class="btn-live">📽️ Launch Live Presentation Viewer</a>
-
-        <div class="upload-section">
-            <h3 style="font-size:1rem; margin-bottom:12px; color:#e2e8f0;">Upload Lecture Material</h3>
-            <form method="POST" action="/upload" enctype="multipart/form-data">
-                <div class="file-input-wrapper">
-                    <input type="file" name="lecture_file" accept=".pptx,.pdf,.docx" required>
-                </div>
-                <button type="submit" class="btn-submit">Ingest & Prepare Lecture</button>
-            </form>
-
-            {% if message %}
-                <div class="msg">{{ message }}</div>
-            {% endif %}
-
-            {% if loaded_files %}
-                <div class="files-list">
-                    <h3>Currently Loaded Materials ({{ loaded_files|length }}):</h3>
-                    {% for f in loaded_files %}
-                        <div class="file-item">
-                            <span>📄 {{ f }}</span>
-                            <form method="POST" action="/remove/{{ loop.index0 }}" style="display:inline;">
-                                <button type="submit" class="btn-remove">Remove</button>
-                            </form>
-                        </div>
-                    {% endfor %}
-                    <form method="POST" action="/clear">
-                        <button type="submit" class="btn-clear-all">Clear All Materials (End of Class)</button>
-                    </form>
-                </div>
-            {% endif %}
-        </div>
-    </div>
-</body>
-</html>
-"""
-
-PRESENTATION_PAGE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Professor - Live Presentation</title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <title>AI Professor Robot - Classroom Presentation & Hub</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         html, body {
@@ -208,10 +29,114 @@ PRESENTATION_PAGE = """
             background: #090d16;
             color: #f8fafc;
             font-family: 'Outfit', sans-serif;
-            user-select: none;
         }
 
-        /* Top Status Bar */
+        /* ——— 1. UPLOAD VIEW (STATE: NO LECTURE LOADED) ——— */
+        #uploadView {
+            display: flex;
+            width: 100vw;
+            height: 100vh;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+            background: radial-gradient(circle at top right, #1e1b4b, #090d16 65%);
+        }
+        .upload-card {
+            background: rgba(30, 41, 59, 0.85);
+            backdrop-filter: blur(16px);
+            border: 1px solid rgba(71, 85, 105, 0.6);
+            border-radius: 20px;
+            padding: 40px;
+            width: 100%;
+            max-width: 540px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.6);
+            text-align: center;
+            animation: fadeIn 0.4s ease-out;
+        }
+        .upload-card h1 {
+            font-size: 2rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, #38bdf8, #818cf8);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 8px;
+        }
+        .upload-card p.subtitle {
+            color: #94a3b8;
+            font-family: 'Inter', sans-serif;
+            font-size: 0.95rem;
+            margin-bottom: 28px;
+        }
+        .dropzone {
+            border: 2px dashed #475569;
+            border-radius: 14px;
+            padding: 36px 20px;
+            background: rgba(15, 23, 42, 0.6);
+            cursor: pointer;
+            transition: all 0.2s ease;
+            margin-bottom: 20px;
+        }
+        .dropzone:hover, .dropzone.dragover {
+            border-color: #38bdf8;
+            background: rgba(56, 189, 248, 0.08);
+            transform: scale(1.01);
+        }
+        .dropzone-icon {
+            font-size: 2.8rem;
+            margin-bottom: 12px;
+            display: block;
+        }
+        .dropzone-text {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #e2e8f0;
+            margin-bottom: 4px;
+        }
+        .dropzone-hint {
+            font-size: 0.82rem;
+            color: #64748b;
+            font-family: 'Inter', sans-serif;
+        }
+        input[type="file"] { display: none; }
+        .btn-upload {
+            width: 100%;
+            background: linear-gradient(135deg, #2563eb, #7c3aed);
+            color: white;
+            border: none;
+            padding: 14px;
+            border-radius: 10px;
+            font-size: 1rem;
+            font-weight: 700;
+            cursor: pointer;
+            box-shadow: 0 4px 14px rgba(124, 58, 237, 0.4);
+            transition: transform 0.15s ease, box-shadow 0.15s ease;
+            font-family: 'Outfit', sans-serif;
+        }
+        .btn-upload:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(124, 58, 237, 0.6);
+        }
+        .btn-upload:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+        .upload-status {
+            margin-top: 16px;
+            font-size: 0.9rem;
+            font-family: 'Inter', sans-serif;
+            color: #38bdf8;
+            min-height: 22px;
+        }
+
+        /* ——— 2. PRESENTATION VIEW (STATE: LECTURE LOADED) ——— */
+        #presentationView {
+            display: none;
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+            background: #090d16;
+        }
         .status-bar {
             position: fixed;
             top: 0;
@@ -221,7 +146,7 @@ PRESENTATION_PAGE = """
             display: flex;
             justify-content: space-between;
             align-items: center;
-            padding: 0 40px;
+            padding: 0 36px;
             background: rgba(15, 23, 42, 0.85);
             backdrop-filter: blur(12px);
             border-bottom: 1px solid rgba(51, 65, 85, 0.6);
@@ -246,8 +171,8 @@ PRESENTATION_PAGE = """
             letter-spacing: 0.05em;
         }
         .live-dot {
-            width: 10px;
-            height: 10px;
+            width: 9px;
+            height: 9px;
             border-radius: 50%;
             background: #10b981;
             box-shadow: 0 0 10px #10b981;
@@ -266,18 +191,18 @@ PRESENTATION_PAGE = """
         .status-right {
             display: flex;
             align-items: center;
-            gap: 18px;
+            gap: 14px;
         }
         .slide-counter {
-            font-size: 1.1rem;
+            font-size: 1.05rem;
             font-weight: 700;
             color: #38bdf8;
             background: rgba(56, 189, 248, 0.1);
             padding: 6px 16px;
-            border-radius: 12px;
+            border-radius: 10px;
             border: 1px solid rgba(56, 189, 248, 0.25);
         }
-        .btn-fullscreen {
+        .btn-ctrl {
             background: #1e293b;
             color: #cbd5e1;
             border: 1px solid #475569;
@@ -286,18 +211,19 @@ PRESENTATION_PAGE = """
             font-size: 0.85rem;
             font-weight: 600;
             cursor: pointer;
-            transition: all 0.2s ease;
+            transition: all 0.15s ease;
+            font-family: 'Inter', sans-serif;
         }
-        .btn-fullscreen:hover {
+        .btn-ctrl:hover {
             background: #334155;
             color: white;
         }
 
-        /* Main Slide Stage */
+        /* Slide Stage */
         .stage {
             position: absolute;
             top: 60px;
-            bottom: 12px;
+            bottom: 8px;
             left: 0;
             right: 0;
             display: flex;
@@ -308,34 +234,29 @@ PRESENTATION_PAGE = """
             max-width: 1400px;
             margin: 0 auto;
         }
-
         .slide-card {
             width: 100%;
             height: 100%;
             display: flex;
             flex-direction: column;
             justify-content: center;
-            opacity: 1;
-            transition: opacity 0.3s ease, transform 0.3s ease;
         }
         .slide-card.entering {
-            animation: slideEnter 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+            animation: slideEnter 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards;
         }
         @keyframes slideEnter {
-            from { opacity: 0; transform: translateY(16px); }
+            from { opacity: 0; transform: translateY(14px); }
             to { opacity: 1; transform: translateY(0); }
         }
-
         .slide-heading {
             font-size: 3.2rem;
             font-weight: 800;
             line-height: 1.2;
-            margin-bottom: 32px;
+            margin-bottom: 30px;
             background: linear-gradient(135deg, #ffffff 40%, #94a3b8 100%);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
         }
-
         .points-list {
             list-style: none;
             display: flex;
@@ -363,13 +284,11 @@ PRESENTATION_PAGE = """
             background: linear-gradient(135deg, #38bdf8, #6366f1);
             box-shadow: 0 0 12px rgba(99, 102, 241, 0.7);
         }
-
-        /* Image / Diagram Card */
         .image-card {
             background: rgba(30, 41, 59, 0.7);
             border: 1px solid rgba(99, 102, 241, 0.35);
             border-radius: 20px;
-            padding: 32px 40px;
+            padding: 30px 40px;
             max-width: 1000px;
             box-shadow: 0 10px 30px rgba(0,0,0,0.4);
             margin-top: 16px;
@@ -377,45 +296,27 @@ PRESENTATION_PAGE = """
         .image-card-header {
             display: flex;
             align-items: center;
-            gap: 12px;
+            gap: 10px;
             color: #818cf8;
-            font-size: 1.1rem;
+            font-size: 1rem;
             font-weight: 700;
-            margin-bottom: 14px;
+            margin-bottom: 12px;
             letter-spacing: 0.05em;
             text-transform: uppercase;
         }
         .image-card-desc {
-            font-size: 1.6rem;
+            font-size: 1.55rem;
             line-height: 1.5;
             color: #cbd5e1;
             font-family: 'Inter', sans-serif;
             font-style: italic;
         }
-
-        /* Empty State */
-        .empty-state {
-            text-align: center;
-            max-width: 600px;
-        }
-        .empty-state h2 {
-            font-size: 2.2rem;
-            margin-bottom: 16px;
-            color: #cbd5e1;
-        }
-        .empty-state p {
-            font-size: 1.2rem;
-            color: #64748b;
-            margin-bottom: 28px;
-        }
-
-        /* Progress Bar */
         .progress-bar-container {
             position: fixed;
             bottom: 0;
             left: 0;
             right: 0;
-            height: 6px;
+            height: 5px;
             background: rgba(15, 23, 42, 0.8);
             z-index: 100;
         }
@@ -425,86 +326,327 @@ PRESENTATION_PAGE = """
             width: 0%;
             transition: width 0.4s ease;
         }
+
+        /* ——— 3. SLIDE-OVER MANAGEMENT DRAWER ——— */
+        .drawer-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0, 0, 0, 0.6);
+            backdrop-filter: blur(4px);
+            z-index: 200;
+        }
+        .drawer {
+            position: fixed;
+            top: 0; right: -420px;
+            width: 400px;
+            height: 100vh;
+            background: #1e293b;
+            border-left: 1px solid #334155;
+            padding: 30px 24px;
+            box-shadow: -10px 0 30px rgba(0, 0, 0, 0.5);
+            z-index: 201;
+            transition: right 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+            display: flex;
+            flex-direction: column;
+        }
+        .drawer.open { right: 0; }
+        .drawer-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid #334155;
+        }
+        .drawer-header h2 { font-size: 1.3rem; font-weight: 700; color: #f8fafc; }
+        .btn-close {
+            background: none;
+            border: none;
+            color: #94a3b8;
+            font-size: 1.5rem;
+            cursor: pointer;
+        }
+        .drawer-body { flex: 1; overflow-y: auto; }
+        .loaded-section h3 {
+            font-size: 0.9rem;
+            color: #94a3b8;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 12px;
+        }
+        .file-pill {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: #0f172a;
+            padding: 10px 14px;
+            border-radius: 8px;
+            margin-bottom: 8px;
+            font-size: 0.88rem;
+            color: #e2e8f0;
+            border: 1px solid #334155;
+        }
+        .btn-pill-remove {
+            background: #ef4444;
+            color: white;
+            border: none;
+            padding: 4px 8px;
+            border-radius: 6px;
+            font-size: 0.75rem;
+            cursor: pointer;
+        }
+        .drawer-upload-box {
+            margin-top: 20px;
+            border-top: 1px solid #334155;
+            padding-top: 20px;
+        }
+        .drawer-upload-box h3 {
+            font-size: 0.9rem;
+            color: #94a3b8;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 10px;
+        }
+        .btn-clear-class {
+            margin-top: auto;
+            width: 100%;
+            background: #dc2626;
+            color: white;
+            border: none;
+            padding: 12px;
+            border-radius: 8px;
+            font-weight: 700;
+            font-size: 0.9rem;
+            cursor: pointer;
+            transition: background 0.15s ease;
+        }
+        .btn-clear-class:hover { background: #b91c1c; }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: scale(0.98); }
+            to { opacity: 1; transform: scale(1); }
+        }
     </style>
 </head>
 <body>
-    <div class="status-bar">
-        <div class="status-left">
-            <div class="live-badge" id="liveBadge">
-                <div class="live-dot"></div>
-                <span id="liveStatusText">LIVE AUTONOMOUS SYNC</span>
+    <!-- 1. UPLOAD VIEW (Default if no lecture loaded) -->
+    <div id="uploadView">
+        <div class="upload-card">
+            <h1>AI Professor Robot</h1>
+            <p class="subtitle">Autonomous Classroom Teaching & Live Presentation</p>
+
+            <div class="dropzone" id="dropzone" onclick="document.getElementById('fileInput').click()">
+                <span class="dropzone-icon">📁</span>
+                <div class="dropzone-text" id="dropzoneText">Click or Drag Lecture File Here</div>
+                <div class="dropzone-hint">Supports PowerPoint (.pptx), PDF (.pdf), Word (.docx)</div>
+                <input type="file" id="fileInput" accept=".pptx,.pdf,.docx" onchange="handleFileSelected(this)">
             </div>
-            <span class="deck-title" id="deckTitle">Loading presentation...</span>
-        </div>
-        <div class="status-right">
-            <div class="slide-counter" id="slideCounter">Slide 1 / 1</div>
-            <button class="btn-fullscreen" onclick="toggleFullScreen()">⛶ Full Screen (F11)</button>
+
+            <button class="btn-upload" id="btnUpload" onclick="uploadSelectedFile()" disabled>
+                🚀 Load & Start Live Presentation
+            </button>
+            <div class="upload-status" id="uploadStatus"></div>
         </div>
     </div>
 
-    <div class="stage">
-        <div class="slide-card entering" id="slideCard">
-            <h1 class="slide-heading" id="slideHeading">Waiting for Lecture...</h1>
-            <ul class="points-list" id="pointsList"></ul>
-            <div class="image-card" id="imageCard" style="display:none;">
-                <div class="image-card-header">
-                    <span>🖼️ Diagram / Image Visual</span>
+    <!-- 2. PRESENTATION VIEW (Active when lecture is loaded) -->
+    <div id="presentationView">
+        <div class="status-bar">
+            <div class="status-left">
+                <div class="live-badge">
+                    <div class="live-dot"></div>
+                    <span>LIVE AUTONOMOUS SYNC</span>
                 </div>
-                <div class="image-card-desc" id="imageCardDesc"></div>
+                <span class="deck-title" id="deckTitle">Lecture Material</span>
             </div>
+            <div class="status-right">
+                <div class="slide-counter" id="slideCounter">Slide 1 / 1</div>
+                <button class="btn-ctrl" onclick="toggleDrawer()">⚙️ Manage Decks</button>
+                <button class="btn-ctrl" onclick="toggleFullScreen()">⛶ Full Screen (F11)</button>
+            </div>
+        </div>
+
+        <div class="stage">
+            <div class="slide-card entering" id="slideCard">
+                <h1 class="slide-heading" id="slideHeading">Starting Lecture...</h1>
+                <ul class="points-list" id="pointsList"></ul>
+                <div class="image-card" id="imageCard" style="display:none;">
+                    <div class="image-card-header">
+                        <span>🖼️ Diagram / Image Visual</span>
+                    </div>
+                    <div class="image-card-desc" id="imageCardDesc"></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="progress-bar-container">
+            <div class="progress-bar-fill" id="progressBar"></div>
         </div>
     </div>
 
-    <div class="progress-bar-container">
-        <div class="progress-bar-fill" id="progressBar"></div>
+    <!-- 3. SLIDE-OVER MANAGEMENT DRAWER -->
+    <div class="drawer-overlay" id="drawerOverlay" onclick="toggleDrawer()"></div>
+    <div class="drawer" id="drawer">
+        <div class="drawer-header">
+            <h2>Lecture Management</h2>
+            <button class="btn-close" onclick="toggleDrawer()">&times;</button>
+        </div>
+        <div class="drawer-body">
+            <div class="loaded-section">
+                <h3>Loaded Files</h3>
+                <div id="loadedFilesList"></div>
+            </div>
+
+            <div class="drawer-upload-box">
+                <h3>Append Another Lecture</h3>
+                <input type="file" id="drawerFileInput" accept=".pptx,.pdf,.docx" style="display:block; margin-bottom:10px; color:#cbd5e1; font-size:0.85rem;" onchange="uploadFromDrawer(this)">
+            </div>
+        </div>
+        <button class="btn-clear-class" onclick="clearClass()">🗑️ Clear All & End Class</button>
     </div>
 
     <script>
         let currentSlideNum = -1;
+        let selectedFile = null;
+        let isPresenting = false;
+
+        // ——— File Drag and Drop / Selection ———
+        const dropzone = document.getElementById('dropzone');
+        ['dragenter', 'dragover'].forEach(name => {
+            dropzone.addEventListener(name, (e) => { e.preventDefault(); dropzone.classList.add('dragover'); }, false);
+        });
+        ['dragleave', 'drop'].forEach(name => {
+            dropzone.addEventListener(name, (e) => { e.preventDefault(); dropzone.classList.remove('dragover'); }, false);
+        });
+        dropzone.addEventListener('drop', (e) => {
+            if (e.dataTransfer.files.length > 0) {
+                selectedFile = e.dataTransfer.files[0];
+                onFileChosen();
+            }
+        });
+
+        function handleFileSelected(input) {
+            if (input.files.length > 0) {
+                selectedFile = input.files[0];
+                onFileChosen();
+            }
+        }
+
+        function onFileChosen() {
+            document.getElementById('dropzoneText').innerText = `Selected: ${selectedFile.name}`;
+            document.getElementById('btnUpload').disabled = false;
+        }
+
+        // ——— Upload Action ———
+        async function uploadSelectedFile() {
+            if (!selectedFile) return;
+            const btn = document.getElementById('btnUpload');
+            const status = document.getElementById('uploadStatus');
+            btn.disabled = true;
+            btn.innerText = '⏳ Processing Lecture & Vision Captions...';
+            status.innerText = 'Extracting slides and embedding concepts...';
+
+            const formData = new FormData();
+            formData.append('lecture_file', selectedFile);
+
+            try {
+                const res = await fetch('/upload', { method: 'POST', body: formData });
+                const data = await res.json();
+                if (data.success) {
+                    status.innerText = 'Success! Transitioning to live view...';
+                    setTimeout(pollStatus, 400);
+                } else {
+                    status.innerText = `Error: ${data.message || 'Failed to upload'}`;
+                    btn.disabled = false;
+                    btn.innerText = '🚀 Load & Start Live Presentation';
+                }
+            } catch (e) {
+                status.innerText = `Network error: ${e.message}`;
+                btn.disabled = false;
+                btn.innerText = '🚀 Load & Start Live Presentation';
+            }
+        }
+
+        async function uploadFromDrawer(input) {
+            if (!input.files || input.files.length === 0) return;
+            const file = input.files[0];
+            const formData = new FormData();
+            formData.append('lecture_file', file);
+            try {
+                await fetch('/upload', { method: 'POST', body: formData });
+                input.value = '';
+                pollStatus();
+            } catch (e) {
+                alert(`Upload failed: ${e.message}`);
+            }
+        }
+
+        // ——— View Switcher & Slide Rendering ———
+        function showPresentationView() {
+            document.getElementById('uploadView').style.display = 'none';
+            document.getElementById('presentationView').style.display = 'block';
+            isPresenting = true;
+        }
+
+        function showUploadView() {
+            document.getElementById('presentationView').style.display = 'none';
+            document.getElementById('uploadView').style.display = 'flex';
+            document.getElementById('btnUpload').disabled = true;
+            document.getElementById('btnUpload').innerText = '🚀 Load & Start Live Presentation';
+            document.getElementById('dropzoneText').innerText = 'Click or Drag Lecture File Here';
+            document.getElementById('uploadStatus').innerText = '';
+            selectedFile = null;
+            isPresenting = false;
+            currentSlideNum = -1;
+        }
 
         function updateSlideUI(data) {
-            if (!data || !data.slide) {
-                document.getElementById('slideHeading').innerText = 'No Lecture Loaded';
-                document.getElementById('pointsList').innerHTML = '<li>Upload a presentation from the dashboard to begin.</li>';
-                document.getElementById('imageCard').style.display = 'none';
-                document.getElementById('slideCounter').innerText = '0 / 0';
-                document.getElementById('progressBar').style.width = '0%';
+            if (!data || data.total_slides === 0 || !data.slide) {
+                if (isPresenting) showUploadView();
                 return;
             }
+
+            if (!isPresenting) showPresentationView();
 
             const slide = data.slide;
             const cur = data.current_slide || slide.slide_number;
             const total = data.total_slides || 1;
 
-            if (cur === currentSlideNum) {
-                return; // already showing this slide
+            // Render drawer file pills
+            if (data.loaded_files) {
+                const list = document.getElementById('loadedFilesList');
+                list.innerHTML = '';
+                data.loaded_files.forEach((f, idx) => {
+                    const pill = document.createElement('div');
+                    pill.className = 'file-pill';
+                    pill.innerHTML = `<span>📄 ${f}</span><button class="btn-pill-remove" onclick="removeFile(${idx})">Remove</button>`;
+                    list.appendChild(pill);
+                });
             }
+
+            if (cur === currentSlideNum) return;
             currentSlideNum = cur;
 
-            // Trigger enter animation
+            // Animate card entrance
             const card = document.getElementById('slideCard');
             card.classList.remove('entering');
-            void card.offsetWidth; // trigger reflow
+            void card.offsetWidth;
             card.classList.add('entering');
 
-            // Source file title
             if (slide.source_file) {
                 document.getElementById('deckTitle').innerText = slide.source_file;
             }
 
-            // Counter & progress
             document.getElementById('slideCounter').innerText = `Slide ${cur} / ${total}`;
             const pct = Math.min(100, Math.max(0, (cur / total) * 100));
             document.getElementById('progressBar').style.width = `${pct}%`;
 
-            // Heading
             const heading = slide.heading || (slide.text.startsWith('#') ? slide.text.split('\\n')[0].replace(/^#+\\s*/, '') : `Slide ${cur}`);
             document.getElementById('slideHeading').innerText = heading;
 
-            // Points & Image Captions
             const pointsList = document.getElementById('pointsList');
             pointsList.innerHTML = '';
-
             const imageCaptions = [];
             const textBullets = [];
 
@@ -522,22 +664,17 @@ PRESENTATION_PAGE = """
                     const trimmed = line.trim();
                     if (!trimmed || trimmed.startsWith('#')) return;
                     const imgMatch = trimmed.match(/^\\[Image:\\s*(.*)\\]$/);
-                    if (imgMatch) {
-                        imageCaptions.push(imgMatch[1]);
-                    } else {
-                        textBullets.push(trimmed);
-                    }
+                    if (imgMatch) imageCaptions.push(imgMatch[1]);
+                    else textBullets.push(trimmed);
                 });
             }
 
-            // Render text bullets
             textBullets.forEach(b => {
                 const li = document.createElement('li');
                 li.innerText = b;
                 pointsList.appendChild(li);
             });
 
-            // Render image caption card if present
             const imageCard = document.getElementById('imageCard');
             if (imageCaptions.length > 0) {
                 imageCard.style.display = 'block';
@@ -547,7 +684,7 @@ PRESENTATION_PAGE = """
             }
         }
 
-        // 1. Connect to live SSE stream
+        // ——— SSE Stream & Polling ———
         function startSSE() {
             const evtSource = new EventSource('/api/slide/stream');
             evtSource.onmessage = function(event) {
@@ -559,13 +696,10 @@ PRESENTATION_PAGE = """
                 }
             };
             evtSource.onerror = function() {
-                // Fall back to polling if SSE drops
-                console.warn('SSE connection interrupted, using status poll fallback...');
                 pollStatus();
             };
         }
 
-        // 2. Periodic status polling fallback
         async function pollStatus() {
             try {
                 const res = await fetch('/api/slide/status');
@@ -578,24 +712,53 @@ PRESENTATION_PAGE = """
             }
         }
 
-        // Fullscreen toggle
-        function toggleFullScreen() {
-            if (!document.fullscreenElement) {
-                document.documentElement.requestFullscreen().catch(err => {
-                    console.error(`Error attempting fullscreen: ${err.message}`);
-                });
+        // ——— Drawer & File Management ———
+        function toggleDrawer() {
+            const drawer = document.getElementById('drawer');
+            const overlay = document.getElementById('drawerOverlay');
+            if (drawer.classList.contains('open')) {
+                drawer.classList.remove('open');
+                overlay.style.display = 'none';
             } else {
-                if (document.exitFullscreen) {
-                    document.exitFullscreen();
-                }
+                drawer.classList.add('open');
+                overlay.style.display = 'block';
             }
         }
 
-        // Initialize on load
+        async function removeFile(index) {
+            try {
+                await fetch(`/remove/${index}`, { method: 'POST' });
+                pollStatus();
+            } catch (e) {
+                alert(`Error removing file: ${e.message}`);
+            }
+        }
+
+        async function clearClass() {
+            if (!confirm('Are you sure you want to clear all loaded materials and end this class session?')) return;
+            try {
+                await fetch('/clear', { method: 'POST' });
+                toggleDrawer();
+                showUploadView();
+            } catch (e) {
+                alert(`Error clearing class: ${e.message}`);
+            }
+        }
+
+        function toggleFullScreen() {
+            if (!document.fullscreenElement) {
+                document.documentElement.requestFullscreen().catch(err => {
+                    console.error(`Fullscreen error: ${err.message}`);
+                });
+            } else {
+                if (document.exitFullscreen) document.exitFullscreen();
+            }
+        }
+
         window.addEventListener('DOMContentLoaded', () => {
             pollStatus();
             startSSE();
-            setInterval(pollStatus, 1500); // safety fallback poll every 1.5s
+            setInterval(pollStatus, 1500);
         });
     </script>
 </body>
@@ -609,23 +772,20 @@ def _loaded_file_names():
 
 @app.route("/")
 def index():
-    return render_template_string(
-        UPLOAD_PAGE,
-        message=None,
-        loaded_files=_loaded_file_names(),
-    )
+    """Single unified endpoint for both upload and presentation."""
+    return render_template_string(UNIFIED_PAGE)
 
 
 @app.route("/presentation")
 def presentation():
-    """Live classroom projector slide viewer (zero software on teacher laptop)."""
-    return render_template_string(PRESENTATION_PAGE)
+    """Alias for / (presentation mode)."""
+    return render_template_string(UNIFIED_PAGE)
 
 
 @app.route("/viewer")
 def viewer():
-    """Alias for /presentation."""
-    return render_template_string(PRESENTATION_PAGE)
+    """Alias for /."""
+    return render_template_string(UNIFIED_PAGE)
 
 
 @app.route("/api/slide/status")
@@ -682,6 +842,7 @@ def slide_stream():
                     "max_slide_reached": max_reached,
                     "total_slides": len(ordered),
                     "slide": current_chunk,
+                    "loaded_files": _loaded_file_names(),
                 }
                 yield f"data: {json.dumps(data)}\n\n"
             time.sleep(0.3)
@@ -724,11 +885,11 @@ def slide_command():
 def upload():
     file = request.files.get("lecture_file")
     if not file or file.filename == "":
-        return render_template_string(UPLOAD_PAGE, message="No file selected.", loaded_files=_loaded_file_names())
+        return jsonify({"success": False, "message": "No file selected."}), 400
 
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
-        return render_template_string(UPLOAD_PAGE, message=f"Unsupported file type: {ext}", loaded_files=_loaded_file_names())
+        return jsonify({"success": False, "message": f"Unsupported file type: {ext}"}), 400
 
     safe_name = secure_filename(file.filename)
     save_path = os.path.join(INBOX_FOLDER, safe_name)
@@ -745,13 +906,16 @@ def upload():
     try:
         already_had_files = bool(rag_engine.get_loaded_files())
         num_chunks = rag_engine.load_lecture(save_path, append=already_had_files)
-        message = f"Success! Added '{os.path.basename(save_path)}' — {num_chunks} chunks ready."
+        return jsonify({
+            "success": True,
+            "message": f"Success! Added '{os.path.basename(save_path)}' ({num_chunks} slides ready).",
+            "filename": os.path.basename(save_path),
+            "total_slides": len(rag_engine.get_ordered_chunks())
+        })
     except Exception as e:
-        message = f"Error processing file: {e}"
         if os.path.exists(save_path):
             os.remove(save_path)
-
-    return render_template_string(UPLOAD_PAGE, message=message, loaded_files=_loaded_file_names())
+        return jsonify({"success": False, "message": f"Error processing file: {e}"}), 500
 
 
 @app.route("/remove/<int:index>", methods=["POST"])
@@ -759,7 +923,7 @@ def remove_one(index):
     files = rag_engine.get_loaded_files()
 
     if index < 0 or index >= len(files):
-        return render_template_string(UPLOAD_PAGE, message="File not found (already removed?).", loaded_files=_loaded_file_names())
+        return jsonify({"success": False, "message": "File not found."}), 404
 
     target_path = files[index]
     target_name = os.path.basename(target_path)
@@ -773,13 +937,12 @@ def remove_one(index):
         except Exception as e:
             print(f"[APP] Could not delete file: {e}")
 
-    return render_template_string(UPLOAD_PAGE, message=f"Removed '{target_name}'.", loaded_files=_loaded_file_names())
+    return jsonify({"success": True, "message": f"Removed '{target_name}'."})
 
 
 @app.route("/clear", methods=["POST"])
 def clear():
     files_to_delete = rag_engine.get_loaded_files()
-
     rag_engine.clear_lecture()
 
     for path in files_to_delete:
@@ -790,7 +953,7 @@ def clear():
             except Exception as e:
                 print(f"[APP] Could not delete file: {e}")
 
-    return render_template_string(UPLOAD_PAGE, message="All lectures cleared and files deleted.", loaded_files=_loaded_file_names())
+    return jsonify({"success": True, "message": "All lectures cleared."})
 
 
 if __name__ == "__main__":
