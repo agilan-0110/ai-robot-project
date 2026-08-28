@@ -471,6 +471,14 @@ def test_flask_browser_live_viewer():
     c_detour, m_detour = rag_engine.get_lecture_progress()
     all_passed &= run_test("Detour goto sets current_slide=1 while preserving max_slide_reached=2", c_detour == 1 and m_detour == 2)
 
+    # 5. Test slide_renderer and /api/slide/image/<N>
+    import slide_renderer
+    sample_ppt = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "inbox", "Leadership-Qualities.pptx")
+    if os.path.exists(sample_ppt):
+        rendered_imgs = slide_renderer.render_deck_slides(sample_ppt)
+        all_passed &= run_test("slide_renderer exports original PPTX slides to PNG images", len(rendered_imgs) > 0)
+        all_passed &= run_test("slide_1.png image file exists on disk", os.path.exists(rendered_imgs[0]))
+
     rag_engine.clear_lecture()
     return all_passed
 

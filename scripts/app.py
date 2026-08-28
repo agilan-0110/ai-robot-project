@@ -1,9 +1,10 @@
 import os
 import json
 import time
-from flask import Flask, request, render_template_string, jsonify, Response
+from flask import Flask, request, render_template_string, jsonify, Response, send_file
 from werkzeug.utils import secure_filename
 import rag_engine
+import slide_renderer
 
 app = Flask(__name__)
 
@@ -26,7 +27,7 @@ UNIFIED_PAGE = """
             width: 100vw;
             height: 100vh;
             overflow: hidden;
-            background: #090d16;
+            background: #000000;
             color: #f8fafc;
             font-family: 'Outfit', sans-serif;
         }
@@ -129,53 +130,85 @@ UNIFIED_PAGE = """
             min-height: 22px;
         }
 
-        /* ——— 2. PRESENTATION VIEW (STATE: LECTURE LOADED) ——— */
+        /* ——— 2. PRESENTATION VIEW (ORIGINAL VISUAL SLIDES) ——— */
         #presentationView {
             display: none;
             position: relative;
             width: 100vw;
             height: 100vh;
-            background: #090d16;
+            background: #000000;
+            overflow: hidden;
         }
+
+        /* Fullscreen Slide Image Viewport */
+        .slide-viewport {
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background: #000000;
+            z-index: 10;
+        }
+        .slide-visual-img {
+            max-width: 100vw;
+            max-height: 100vh;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            transition: opacity 0.25s ease, transform 0.25s ease;
+            user-select: none;
+        }
+        .slide-visual-img.fading {
+            opacity: 0;
+            transform: scale(0.99);
+        }
+
+        /* Floating Top Bar (Discreet & Projector Optimized) */
         .status-bar {
             position: fixed;
             top: 0;
             left: 0;
             right: 0;
-            height: 60px;
+            height: 54px;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            padding: 0 36px;
-            background: rgba(15, 23, 42, 0.85);
-            backdrop-filter: blur(12px);
-            border-bottom: 1px solid rgba(51, 65, 85, 0.6);
+            padding: 0 28px;
+            background: linear-gradient(180deg, rgba(0, 0, 0, 0.8) 0%, rgba(0, 0, 0, 0) 100%);
             z-index: 100;
+            opacity: 0.85;
+            transition: opacity 0.3s ease;
+        }
+        .status-bar:hover {
+            opacity: 1;
+            background: rgba(15, 23, 42, 0.85);
+            backdrop-filter: blur(10px);
         }
         .status-left {
             display: flex;
             align-items: center;
-            gap: 16px;
+            gap: 14px;
         }
         .live-badge {
             display: flex;
             align-items: center;
             gap: 8px;
-            background: rgba(16, 185, 129, 0.15);
-            border: 1px solid rgba(16, 185, 129, 0.4);
+            background: rgba(16, 185, 129, 0.2);
+            border: 1px solid rgba(16, 185, 129, 0.5);
             color: #34d399;
-            padding: 6px 14px;
+            padding: 4px 12px;
             border-radius: 20px;
-            font-size: 0.85rem;
+            font-size: 0.8rem;
             font-weight: 700;
             letter-spacing: 0.05em;
         }
         .live-dot {
-            width: 9px;
-            height: 9px;
+            width: 8px;
+            height: 8px;
             border-radius: 50%;
             background: #10b981;
-            box-shadow: 0 0 10px #10b981;
+            box-shadow: 0 0 8px #10b981;
             animation: pulse 1.5s infinite;
         }
         @keyframes pulse {
@@ -183,32 +216,33 @@ UNIFIED_PAGE = """
             50% { opacity: 0.4; transform: scale(0.85); }
         }
         .deck-title {
-            color: #94a3b8;
-            font-size: 0.95rem;
+            color: #cbd5e1;
+            font-size: 0.9rem;
             font-weight: 500;
             font-family: 'Inter', sans-serif;
+            text-shadow: 0 1px 3px rgba(0,0,0,0.8);
         }
         .status-right {
             display: flex;
             align-items: center;
-            gap: 14px;
+            gap: 12px;
         }
         .slide-counter {
-            font-size: 1.05rem;
+            font-size: 0.95rem;
             font-weight: 700;
             color: #38bdf8;
-            background: rgba(56, 189, 248, 0.1);
-            padding: 6px 16px;
-            border-radius: 10px;
-            border: 1px solid rgba(56, 189, 248, 0.25);
+            background: rgba(15, 23, 42, 0.7);
+            padding: 4px 14px;
+            border-radius: 8px;
+            border: 1px solid rgba(56, 189, 248, 0.3);
         }
         .btn-ctrl {
-            background: #1e293b;
+            background: rgba(30, 41, 59, 0.7);
             color: #cbd5e1;
             border: 1px solid #475569;
-            padding: 6px 14px;
-            border-radius: 8px;
-            font-size: 0.85rem;
+            padding: 5px 12px;
+            border-radius: 7px;
+            font-size: 0.8rem;
             font-weight: 600;
             cursor: pointer;
             transition: all 0.15s ease;
@@ -219,112 +253,21 @@ UNIFIED_PAGE = """
             color: white;
         }
 
-        /* Slide Stage */
-        .stage {
-            position: absolute;
-            top: 60px;
-            bottom: 8px;
-            left: 0;
-            right: 0;
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            align-items: center;
-            padding: 40px 80px;
-            max-width: 1400px;
-            margin: 0 auto;
-        }
-        .slide-card {
-            width: 100%;
-            height: 100%;
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-        }
-        .slide-card.entering {
-            animation: slideEnter 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-        }
-        @keyframes slideEnter {
-            from { opacity: 0; transform: translateY(14px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-        .slide-heading {
-            font-size: 3.2rem;
-            font-weight: 800;
-            line-height: 1.2;
-            margin-bottom: 30px;
-            background: linear-gradient(135deg, #ffffff 40%, #94a3b8 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-        .points-list {
-            list-style: none;
-            display: flex;
-            flex-direction: column;
-            gap: 20px;
-            max-width: 1100px;
-        }
-        .points-list li {
-            position: relative;
-            padding-left: 36px;
-            font-size: 1.8rem;
-            line-height: 1.45;
-            color: #e2e8f0;
-            font-weight: 500;
-            font-family: 'Inter', sans-serif;
-        }
-        .points-list li::before {
-            content: "";
-            position: absolute;
-            left: 4px;
-            top: 14px;
-            width: 12px;
-            height: 12px;
-            border-radius: 4px;
-            background: linear-gradient(135deg, #38bdf8, #6366f1);
-            box-shadow: 0 0 12px rgba(99, 102, 241, 0.7);
-        }
-        .image-card {
-            background: rgba(30, 41, 59, 0.7);
-            border: 1px solid rgba(99, 102, 241, 0.35);
-            border-radius: 20px;
-            padding: 30px 40px;
-            max-width: 1000px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.4);
-            margin-top: 16px;
-        }
-        .image-card-header {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            color: #818cf8;
-            font-size: 1rem;
-            font-weight: 700;
-            margin-bottom: 12px;
-            letter-spacing: 0.05em;
-            text-transform: uppercase;
-        }
-        .image-card-desc {
-            font-size: 1.55rem;
-            line-height: 1.5;
-            color: #cbd5e1;
-            font-family: 'Inter', sans-serif;
-            font-style: italic;
-        }
+        /* Bottom Progress Bar */
         .progress-bar-container {
             position: fixed;
             bottom: 0;
             left: 0;
             right: 0;
-            height: 5px;
-            background: rgba(15, 23, 42, 0.8);
+            height: 4px;
+            background: rgba(0, 0, 0, 0.5);
             z-index: 100;
         }
         .progress-bar-fill {
             height: 100%;
             background: linear-gradient(90deg, #38bdf8, #818cf8);
             width: 0%;
-            transition: width 0.4s ease;
+            transition: width 0.35s ease;
         }
 
         /* ——— 3. SLIDE-OVER MANAGEMENT DRAWER ——— */
@@ -332,7 +275,7 @@ UNIFIED_PAGE = """
             display: none;
             position: fixed;
             top: 0; left: 0; right: 0; bottom: 0;
-            background: rgba(0, 0, 0, 0.6);
+            background: rgba(0, 0, 0, 0.7);
             backdrop-filter: blur(4px);
             z-index: 200;
         }
@@ -439,7 +382,7 @@ UNIFIED_PAGE = """
             <div class="dropzone" id="dropzone" onclick="document.getElementById('fileInput').click()">
                 <span class="dropzone-icon">📁</span>
                 <div class="dropzone-text" id="dropzoneText">Click or Drag Lecture File Here</div>
-                <div class="dropzone-hint">Supports PowerPoint (.pptx), PDF (.pdf), Word (.docx)</div>
+                <div class="dropzone-hint">PowerPoint (.pptx) or PDF (.pdf)</div>
                 <input type="file" id="fileInput" accept=".pptx,.pdf,.docx" onchange="handleFileSelected(this)">
             </div>
 
@@ -450,7 +393,7 @@ UNIFIED_PAGE = """
         </div>
     </div>
 
-    <!-- 2. PRESENTATION VIEW (Active when lecture is loaded) -->
+    <!-- 2. PRESENTATION VIEW (ORIGINAL VISUAL SLIDES) -->
     <div id="presentationView">
         <div class="status-bar">
             <div class="status-left">
@@ -467,17 +410,8 @@ UNIFIED_PAGE = """
             </div>
         </div>
 
-        <div class="stage">
-            <div class="slide-card entering" id="slideCard">
-                <h1 class="slide-heading" id="slideHeading">Starting Lecture...</h1>
-                <ul class="points-list" id="pointsList"></ul>
-                <div class="image-card" id="imageCard" style="display:none;">
-                    <div class="image-card-header">
-                        <span>🖼️ Diagram / Image Visual</span>
-                    </div>
-                    <div class="image-card-desc" id="imageCardDesc"></div>
-                </div>
-            </div>
+        <div class="slide-viewport">
+            <img id="slideVisualImg" class="slide-visual-img" src="" alt="Slide Visual">
         </div>
 
         <div class="progress-bar-container">
@@ -544,8 +478,8 @@ UNIFIED_PAGE = """
             const btn = document.getElementById('btnUpload');
             const status = document.getElementById('uploadStatus');
             btn.disabled = true;
-            btn.innerText = '⏳ Processing Lecture & Vision Captions...';
-            status.innerText = 'Extracting slides and embedding concepts...';
+            btn.innerText = '⏳ Rendering Original Slides & Preparing Brain...';
+            status.innerText = 'Converting slides to high-res visuals and indexing...';
 
             const formData = new FormData();
             formData.append('lecture_file', selectedFile);
@@ -554,7 +488,7 @@ UNIFIED_PAGE = """
                 const res = await fetch('/upload', { method: 'POST', body: formData });
                 const data = await res.json();
                 if (data.success) {
-                    status.innerText = 'Success! Transitioning to live view...';
+                    status.innerText = 'Success! Starting live presentation...';
                     setTimeout(pollStatus, 400);
                 } else {
                     status.innerText = `Error: ${data.message || 'Failed to upload'}`;
@@ -602,15 +536,14 @@ UNIFIED_PAGE = """
         }
 
         function updateSlideUI(data) {
-            if (!data || data.total_slides === 0 || !data.slide) {
+            if (!data || data.total_slides === 0) {
                 if (isPresenting) showUploadView();
                 return;
             }
 
             if (!isPresenting) showPresentationView();
 
-            const slide = data.slide;
-            const cur = data.current_slide || slide.slide_number;
+            const cur = data.current_slide || 1;
             const total = data.total_slides || 1;
 
             // Render drawer file pills
@@ -628,60 +561,21 @@ UNIFIED_PAGE = """
             if (cur === currentSlideNum) return;
             currentSlideNum = cur;
 
-            // Animate card entrance
-            const card = document.getElementById('slideCard');
-            card.classList.remove('entering');
-            void card.offsetWidth;
-            card.classList.add('entering');
-
-            if (slide.source_file) {
-                document.getElementById('deckTitle').innerText = slide.source_file;
+            // Update title & counter
+            if (data.slide && data.slide.source_file) {
+                document.getElementById('deckTitle').innerText = data.slide.source_file;
             }
-
             document.getElementById('slideCounter').innerText = `Slide ${cur} / ${total}`;
             const pct = Math.min(100, Math.max(0, (cur / total) * 100));
             document.getElementById('progressBar').style.width = `${pct}%`;
 
-            const heading = slide.heading || (slide.text.startsWith('#') ? slide.text.split('\\n')[0].replace(/^#+\\s*/, '') : `Slide ${cur}`);
-            document.getElementById('slideHeading').innerText = heading;
-
-            const pointsList = document.getElementById('pointsList');
-            pointsList.innerHTML = '';
-            const imageCaptions = [];
-            const textBullets = [];
-
-            if (slide.points && slide.points.length > 0) {
-                slide.points.forEach(p => {
-                    const imgMatch = p.match(/^\\[Image:\\s*(.*)\\]$/);
-                    if (imgMatch) {
-                        imageCaptions.push(imgMatch[1]);
-                    } else if (p.trim() && p.trim() !== heading) {
-                        textBullets.push(p);
-                    }
-                });
-            } else if (slide.text) {
-                slide.text.split('\\n').forEach(line => {
-                    const trimmed = line.trim();
-                    if (!trimmed || trimmed.startsWith('#')) return;
-                    const imgMatch = trimmed.match(/^\\[Image:\\s*(.*)\\]$/);
-                    if (imgMatch) imageCaptions.push(imgMatch[1]);
-                    else textBullets.push(trimmed);
-                });
-            }
-
-            textBullets.forEach(b => {
-                const li = document.createElement('li');
-                li.innerText = b;
-                pointsList.appendChild(li);
-            });
-
-            const imageCard = document.getElementById('imageCard');
-            if (imageCaptions.length > 0) {
-                imageCard.style.display = 'block';
-                document.getElementById('imageCardDesc').innerText = imageCaptions.join(' ');
-            } else {
-                imageCard.style.display = 'none';
-            }
+            // Transition Slide Visual Image
+            const img = document.getElementById('slideVisualImg');
+            img.classList.add('fading');
+            setTimeout(() => {
+                img.src = `/api/slide/image/${cur}?t=${Date.now()}`;
+                img.onload = () => { img.classList.remove('fading'); };
+            }, 100);
         }
 
         // ——— SSE Stream & Polling ———
@@ -772,20 +666,64 @@ def _loaded_file_names():
 
 @app.route("/")
 def index():
-    """Single unified endpoint for both upload and presentation."""
+    """Single unified endpoint for both upload and live original slide presentation."""
     return render_template_string(UNIFIED_PAGE)
 
 
 @app.route("/presentation")
 def presentation():
-    """Alias for / (presentation mode)."""
     return render_template_string(UNIFIED_PAGE)
 
 
 @app.route("/viewer")
 def viewer():
-    """Alias for /."""
     return render_template_string(UNIFIED_PAGE)
+
+
+@app.route("/api/slide/image/<int:slide_number>")
+def get_slide_image(slide_number):
+    """
+    Returns the high-resolution rendered original slide image for the requested slide number.
+    """
+    ordered = rag_engine.get_ordered_chunks()
+    if not ordered or slide_number < 1 or slide_number > len(ordered):
+        return jsonify({"error": "Slide number not found"}), 404
+
+    target_chunk = ordered[slide_number - 1]
+    source_file = target_chunk.get("source_file")
+
+    # Look up full filepath from loaded files
+    full_path = None
+    for loaded in rag_engine.get_loaded_files():
+        if os.path.basename(loaded) == source_file or loaded == source_file:
+            full_path = loaded
+            break
+
+    if not full_path:
+        # Check inbox folder directly
+        candidate = os.path.join(INBOX_FOLDER, source_file)
+        if os.path.exists(candidate):
+            full_path = candidate
+
+    if full_path:
+        # Determine internal slide number within this specific file
+        file_chunks = [c for c in ordered if c.get("source_file") == source_file]
+        try:
+            internal_num = file_chunks.index(target_chunk) + 1
+        except ValueError:
+            internal_num = target_chunk.get("slide_number", slide_number)
+
+        img_path = slide_renderer.get_slide_image_path(full_path, internal_num)
+        if img_path and os.path.exists(img_path):
+            return send_file(img_path, mimetype="image/png")
+
+        # If cache is missing, render on the fly
+        slide_renderer.render_deck_slides(full_path)
+        img_path = slide_renderer.get_slide_image_path(full_path, internal_num)
+        if img_path and os.path.exists(img_path):
+            return send_file(img_path, mimetype="image/png")
+
+    return jsonify({"error": "Slide visual image unavailable"}), 404
 
 
 @app.route("/api/slide/status")
@@ -906,6 +844,13 @@ def upload():
     try:
         already_had_files = bool(rag_engine.get_loaded_files())
         num_chunks = rag_engine.load_lecture(save_path, append=already_had_files)
+
+        # Render original visual slide images (PNGs)
+        try:
+            slide_renderer.render_deck_slides(save_path)
+        except Exception as render_err:
+            print(f"[APP] Slide visual rendering notice: {render_err}")
+
         return jsonify({
             "success": True,
             "message": f"Success! Added '{os.path.basename(save_path)}' ({num_chunks} slides ready).",
@@ -929,6 +874,7 @@ def remove_one(index):
     target_name = os.path.basename(target_path)
 
     rag_engine.remove_file(target_path)
+    slide_renderer.clear_deck_cache(target_path)
 
     if os.path.exists(target_path):
         try:
@@ -944,6 +890,7 @@ def remove_one(index):
 def clear():
     files_to_delete = rag_engine.get_loaded_files()
     rag_engine.clear_lecture()
+    slide_renderer.clear_deck_cache()
 
     for path in files_to_delete:
         if os.path.exists(path):

@@ -680,6 +680,12 @@ def remove_file(file_path):
 
     _loaded_files = [f for f in _loaded_files if f != file_path]
 
+    try:
+        import slide_renderer
+        slide_renderer.clear_deck_cache(file_path)
+    except Exception:
+        pass
+
     print(f"[RAG] Removed file: {file_path} (remaining chunks: {len(_slide_texts)})")
     return True
 
@@ -875,6 +881,11 @@ def clear_lecture():
     _conversation_history = []
     _current_lecture_slide = 0
     _max_slide_reached = 0
+    try:
+        import slide_renderer
+        slide_renderer.clear_deck_cache()
+    except Exception:
+        pass
     print("[RAG] Lecture(s) and conversation history cleared from memory.")
 
 

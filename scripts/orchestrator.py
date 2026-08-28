@@ -15,6 +15,7 @@ Requires rag_engine.py in the same folder (or on PYTHONPATH), and
 GROQ_API_KEY set as an environment variable.
 """
 import os
+import sys
 import time
 import re
 import subprocess
@@ -22,6 +23,12 @@ import wave
 import traceback
 import requests
 import numpy as np
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 import rag_engine
 
@@ -74,9 +81,11 @@ GROQ_MODEL = "openai/gpt-oss-120b"   # confirmed production model — 20b is una
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # ——— TTS / SPEAKER SETTINGS ———
-PIPER_MODEL = "/home/jetson/ai-robot-project/voices/en_US-ryan-medium.onnx"
-AUDIO_DEVICE = "plughw:0,3"
-SPEECH_WAV = "/home/jetson/ai-professor/last_answer.wav"
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_LOCAL_VOICE = os.path.join(_PROJECT_ROOT, "voices", "en_US-ryan-medium.onnx")
+PIPER_MODEL = os.environ.get("PIPER_MODEL", _LOCAL_VOICE if os.path.exists(_LOCAL_VOICE) else "/home/jetson/ai-robot-project/voices/en_US-ryan-medium.onnx")
+AUDIO_DEVICE = os.environ.get("AUDIO_DEVICE", "plughw:0,3")
+SPEECH_WAV = os.environ.get("SPEECH_WAV", os.path.join(_PROJECT_ROOT, "last_answer.wav") if sys.platform == "win32" else "/home/jetson/ai-professor/last_answer.wav")
 PIPER_LENGTH_SCALE = 1.2
 
 # ——— SLIDE COMPANION / PROJECTOR SETTINGS (Feature 1) ———
@@ -204,23 +213,19 @@ def find_mic_device(name_hint=MIC_NAME_HINT):
               f"({devices[idx]['max_input_channels']} in)")
         return idx
 
-    # No name match — show every usable input device so the person
-    # running this can pick manually instead of guessing.
+    # No name match — pick default or first available input device
     any_input = [
         (i, d) for i, d in enumerate(devices) if d["max_input_channels"] > 0
     ]
-    print(f"[SETUP] No input device matched name hint '{name_hint}'.")
     if any_input:
-        print("[SETUP] Available input devices:")
-        for i, d in any_input:
-            print(f"    [{i}] {d['name']} ({d['max_input_channels']} in)")
-        print("[SETUP] Update MIC_NAME_HINT at the top of this file to match "
-              "one of the names above, or pass its index directly.")
+        default_idx = any_input[0][0]
+        print(f"[SETUP] Note: name hint '{name_hint}' not matched, falling back to default mic: [{default_idx}] {devices[default_idx]['name']}")
+        return default_idx
     else:
         print("[SETUP] No input-capable audio devices found at all.")
         print("[SETUP] Check that the mic is physically connected/powered on, then run:")
         print('    python -c "import sounddevice as sd; print(sd.query_devices())"')
-    raise RuntimeError("No usable microphone found — see device list above.")
+        raise RuntimeError("No usable microphone found — see device list above.")
 
 
 # =====================================================================
@@ -592,7 +597,14 @@ def speak_answer(voice, answer):
         pad_wav_silence(SPEECH_WAV, lead_ms=400, trail_ms=400)
         t1 = time.time()
         print(f"[SPEAKING] synthesis took {t1 - t0:.2f}s")
-        subprocess.run(["aplay", "-D", AUDIO_DEVICE, SPEECH_WAV], check=True)
+        if sys.platform == "win32":
+            try:
+                import winsound
+                winsound.PlaySound(SPEECH_WAV, winsound.SND_FILENAME)
+            except Exception as pe:
+                print(f"[SPEAKING] Windows audio playback note: {pe}")
+        else:
+            subprocess.run(["aplay", "-D", AUDIO_DEVICE, SPEECH_WAV], check=True)
         t2 = time.time()
         print(f"[SPEAKING] playback took {t2 - t1:.2f}s")
     except Exception as e:
@@ -679,10 +691,25 @@ def build_slide_explanation_prompt(slide_text):
     return system_prompt, user_content
 
 
+def normalize_unicode_text(text):
+    if not text:
+        return ""
+    text = (text.replace('\u2011', '-')
+                .replace('\u2013', '-')
+                .replace('\u2014', '-')
+                .replace('\u2018', "'")
+                .replace('\u2019', "'")
+                .replace('\u201c', '"')
+                .replace('\u201d', '"')
+                .replace('\u00a0', ' '))
+    return text.encode('ascii', 'ignore').decode('ascii')
+
+
 def generate_slide_explanation(slide_text):
     if not GROQ_API_KEY:
         return "Sorry, I can't reach my brain right now."
 
+    slide_text = normalize_unicode_text(slide_text)
     system_prompt, user_content = build_slide_explanation_prompt(slide_text)
 
     headers = {
@@ -702,7 +729,8 @@ def generate_slide_explanation(slide_text):
         response = requests.post(GROQ_URL, headers=headers, json=payload, timeout=15)
         response.raise_for_status()
         answer = response.json()["choices"][0]["message"]["content"].strip()
-        return clean_for_speech(answer)
+        answer = normalize_unicode_text(clean_for_speech(answer))
+        return answer
     except Exception as e:
         print(f"[TEACHING] Error generating slide explanation: {e}")
         return "Let's move on to the next point."

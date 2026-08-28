@@ -17,3 +17,8 @@ __pycache__/
 *.onnx
 *.bin
 *.safetensors
+
+scripts/static/
+static/
+*checkpoint.json
+
