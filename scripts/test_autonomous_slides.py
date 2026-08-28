@@ -411,6 +411,51 @@ def test_image_only_and_elaborate_prompts():
     return all_passed
 
 
+def test_flask_browser_live_viewer():
+    print("\n--- Test Suite 4: Flask Browser Live Viewer Endpoints ---")
+    all_passed = True
+
+    import app as flask_app
+    client = flask_app.app.test_client()
+
+    # Setup dummy slides in rag_engine
+    rag_engine.clear_lecture()
+    rag_engine._slide_texts = [
+        {"slide_number": 1, "text": "Slide 1: Intro", "heading": "Intro", "points": ["Welcome"], "source_file": "lecture.pptx"},
+        {"slide_number": 2, "text": "Slide 2: Physics", "heading": "Physics", "points": ["Force", "Motion"], "source_file": "lecture.pptx"},
+    ]
+    rag_engine.set_lecture_progress(1)
+
+    # 1. Test GET /presentation
+    res_page = client.get("/presentation")
+    all_passed &= run_test("GET /presentation returns 200 OK", res_page.status_code == 200)
+    all_passed &= run_test("GET /presentation contains live sync script", b"EventSource" in res_page.data)
+
+    # 2. Test GET /api/slide/status
+    res_status = client.get("/api/slide/status")
+    all_passed &= run_test("GET /api/slide/status returns 200 OK", res_status.status_code == 200)
+    status_data = res_status.get_json()
+    all_passed &= run_test("Status data reflects slide 1", status_data["current_slide"] == 1 and status_data["total_slides"] == 2)
+    all_passed &= run_test("Status slide heading is 'Intro'", status_data["slide"]["heading"] == "Intro")
+
+    # 3. Test POST /api/slide/command 'next'
+    res_cmd_next = client.post("/api/slide/command", json={"command": "next"})
+    all_passed &= run_test("POST /api/slide/command 'next' returns 200 OK", res_cmd_next.status_code == 200)
+    cmd_next_data = res_cmd_next.get_json()
+    all_passed &= run_test("Next command response has status 'done' and advances to slide 2", cmd_next_data["status"] == "done" and cmd_next_data["current_slide"] == 2)
+    c, m = rag_engine.get_lecture_progress()
+    all_passed &= run_test("rag_engine updated progress to slide 2", c == 2 and m == 2)
+
+    # 4. Test POST /api/slide/command 'goto' (detour to slide 1)
+    res_cmd_goto = client.post("/api/slide/command", json={"command": "goto", "slide": 1})
+    all_passed &= run_test("POST /api/slide/command 'goto' returns 200 OK", res_cmd_goto.status_code == 200)
+    c_detour, m_detour = rag_engine.get_lecture_progress()
+    all_passed &= run_test("Detour goto sets current_slide=1 while preserving max_slide_reached=2", c_detour == 1 and m_detour == 2)
+
+    rag_engine.clear_lecture()
+    return all_passed
+
+
 if __name__ == "__main__":
     print("=" * 70)
     print("RUNNING AUTONOMOUS SLIDES & RAG TEST SUITE")
@@ -422,9 +467,10 @@ if __name__ == "__main__":
     t4 = test_doubt_detour_flow()
     t5 = test_not_covered_yet_filtering()
     t6 = test_image_only_and_elaborate_prompts()
+    t7 = test_flask_browser_live_viewer()
 
     print("\n" + "=" * 70)
-    if t1 and t2 and t3 and t4 and t5 and t6:
+    if t1 and t2 and t3 and t4 and t5 and t6 and t7:
         print("ALL TESTS PASSED!")
         print("=" * 70)
         sys.exit(0)
@@ -432,5 +478,6 @@ if __name__ == "__main__":
         print("SOME TESTS FAILED!")
         print("=" * 70)
         sys.exit(1)
+
 
 

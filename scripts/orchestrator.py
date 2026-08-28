@@ -81,22 +81,26 @@ PIPER_LENGTH_SCALE = 1.2
 
 # ——— SLIDE COMPANION / PROJECTOR SETTINGS (Feature 1) ———
 SLIDE_COMPANION_HOST = os.environ.get("SLIDE_COMPANION_HOST", "127.0.0.1")
-SLIDE_COMPANION_PORT = int(os.environ.get("SLIDE_COMPANION_PORT", "5055"))
+SLIDE_COMPANION_PORT = int(os.environ.get("SLIDE_COMPANION_PORT", "5000"))
 
 
 class SlideClient:
     """
-    Client for autonomous slide control on the teacher's laptop projector.
-    Sends 'next' and 'goto <N>' commands via HTTP to the companion script.
-    Retries up to 3 times with 1s backoff if no 'done' acknowledgment is received,
-    mirroring the retry pattern in rag_engine.py.
+    Client for autonomous slide control.
+    Supports:
+      1. Browser Live Viewer on Jetson (Flask app.py on port 5000 -> /api/slide/command) [Default, 0 software on laptop]
+      2. Companion script on laptop (slide_companion.py on port 5055 -> /command)
+    Retries up to 3 times with 1s backoff if no 'done' acknowledgment is received.
     """
     def __init__(self, host=SLIDE_COMPANION_HOST, port=SLIDE_COMPANION_PORT, timeout=3.0, max_retries=3):
         self.host = host
         self.port = port
         self.timeout = timeout
         self.max_retries = max_retries
-        self.url = f"http://{self.host}:{self.port}/command"
+        if int(self.port) == 5000:
+            self.url = f"http://{self.host}:{self.port}/api/slide/command"
+        else:
+            self.url = f"http://{self.host}:{self.port}/command"
 
     def send_command(self, command, slide_number=None):
         payload = {"command": command}
